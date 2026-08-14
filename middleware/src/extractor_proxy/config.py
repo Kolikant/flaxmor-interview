@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     service_name: str = "extractor-proxy"
     system_prompt_path: Path = Field(default_factory=discover_system_prompt_path)
 
+    # Bind address for the entrypoint in __main__.py. Defaults to all interfaces
+    # because the process is expected to run inside a container.
+    host: str = "0.0.0.0"
+    port: int = 8000
+
     @field_validator("openai_base_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:

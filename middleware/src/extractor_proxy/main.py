@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from extractor_proxy import __version__
 from extractor_proxy.config import Settings, get_settings
+from extractor_proxy.observability import RequestLifecycleMiddleware
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -25,6 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
     )
     app.state.settings = settings
+    app.add_middleware(RequestLifecycleMiddleware)
     return app
 
 
