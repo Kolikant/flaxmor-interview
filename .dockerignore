@@ -1,0 +1,33 @@
+# The build context is the repository root so that SYSTEM_PROMPT.md — which the
+# service loads at runtime — is reachable by COPY. Docker does not read .gitignore,
+# so without this file the real key in .env would be baked into an image layer.
+
+.env
+.env.*
+
+.git/
+.gitignore
+.github/
+
+# Assignment brief supplied by Flaxmor — not part of the image or the deliverable
+assignment*.txt
+assignment*.md
+assignment*.pdf
+
+# Virtualenvs and caches: the image installs its own dependencies
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/*.egg-info/
+htmlcov/
+.coverage
+
+# Tests are not needed at runtime
+middleware/tests/
+
+scripts/
+README.md
+.DS_Store

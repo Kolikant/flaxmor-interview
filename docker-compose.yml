@@ -1,0 +1,109 @@
+name: flaxmor-extractor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openwebui}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openwebui}
+      POSTGRES_DB: ${POSTGRES_DB:-openwebui}
+    # No published port on purpose. Only Open WebUI talks to it, over the compose
+    # network, and host 5432 is frequently already taken by a local Postgres — which
+    # would make `docker compose up` fail for a reason unrelated to this project.
+    # Inspect it with: docker compose exec postgres psql -U openwebui -d openwebui
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Open WebUI does not retry its first database connection, so it must not start
+      # until Postgres is genuinely accepting queries rather than merely running.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openwebui} -d ${POSTGRES_DB:-openwebui}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  middleware:
+    build:
+      # Repository root, so SYSTEM_PROMPT.md is inside the build context.
+      context: .
+      dockerfile: middleware/Dockerfile
+    # env_file is scoped to this service alone. Open WebUI must never receive the real
+    # key: it would become the credential Open WebUI presents to this proxy, and it
+    # would be readable in Open WebUI's admin UI in the browser.
+    env_file:
+      - .env
+    environment:
+      # Explicit, so the prompt loader never depends on its upward path walk finding a
+      # repo-root file from an installed package.
+      SYSTEM_PROMPT_PATH: /app/SYSTEM_PROMPT.md
+      EXPOSED_MODELS: ${EXPOSED_MODELS:-gpt-4o-mini}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${MIDDLEWARE_PORT:-8000}:8000"
+    healthcheck:
+      # python:3.11-slim ships neither curl nor wget, and a healthcheck naming a
+      # missing binary leaves the container permanently unhealthy — which would wedge
+      # anything gated on it, with no useful symptom.
+      #
+      # /healthz, not /readyz: readiness fails when OPENAI_API_KEY is absent, so
+      # gating Open WebUI on readiness would turn "forgot to fill in .env" into
+      # "Open WebUI never starts", rather than a 503 that names the missing key.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz').read()
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:0.6.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      middleware:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openwebui}:${POSTGRES_PASSWORD:-openwebui}@postgres:5432/${POSTGRES_DB:-openwebui}
+
+      # The proxy, standing in for api.openai.com. No trailing slash: Open WebUI
+      # builds its calls as f"{url}/models", so a trailing slash yields //models.
+      OPENAI_API_BASE_URL: http://middleware:8000/v1
+      # A placeholder, never the real key. The middleware discards the inbound
+      # Authorization header and authenticates upstream with its own configured key.
+      OPENAI_API_KEY: ${MIDDLEWARE_API_KEY:-local-dev-placeholder}
+
+      # Open WebUI stores OPENAI_API_BASE_URL and OPENAI_API_KEY in Postgres on first
+      # boot and thereafter ignores the environment. Without this flag, correcting the
+      # base URL above appears to do nothing. Reset state with `docker compose down -v`.
+      ENABLE_PERSISTENT_CONFIG: "false"
+      # Skip probing localhost:11434 on every model fetch.
+      ENABLE_OLLAMA_API: "false"
+      # Pinned so login sessions survive a container restart; generated per-start
+      # otherwise, which invalidates every existing token.
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-local-dev-secret-change-me}
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    healthcheck:
+      # /health/db runs SELECT 1, so this proves the Postgres hop rather than only
+      # that the process is listening.
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8080/health/db').read()
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # First boot runs database migrations and loads local embedding models.
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  open-webui-data:
