@@ -8,9 +8,48 @@ prompt prepended. Open WebUI's own internal calls are deliberately left alone; s
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("extractor_proxy.prompt")
+
+#: Delimiters around the prompt inside SYSTEM_PROMPT.md. HTML comments are invisible
+#: when the document is rendered, so the file stays readable as documentation while
+#: remaining unambiguous to parse.
+PROMPT_BEGIN_MARKER = "<!-- SYSTEM_PROMPT:BEGIN -->"
+PROMPT_END_MARKER = "<!-- SYSTEM_PROMPT:END -->"
+
+
+class PromptUnavailableError(RuntimeError):
+    """Raised when SYSTEM_PROMPT.md is missing, unreadable, or has no prompt block."""
+
+
+def load_system_prompt(path: Path) -> str:
+    """Read the prompt out of SYSTEM_PROMPT.md.
+
+    The document is the single source of truth rather than a Python constant, so the
+    artefact reviewed and the bytes sent upstream are the same thing. The cost is a
+    startup-time file read and this parser; the benefit is that editing the prompt
+    cannot leave the documentation stale.
+    """
+    try:
+        document = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PromptUnavailableError(f"cannot read prompt document at {path}: {exc}") from exc
+
+    _, _, after_begin = document.partition(PROMPT_BEGIN_MARKER)
+    if not after_begin:
+        raise PromptUnavailableError(f"{path} is missing {PROMPT_BEGIN_MARKER}")
+
+    body, separator, _ = after_begin.partition(PROMPT_END_MARKER)
+    if not separator:
+        raise PromptUnavailableError(f"{path} is missing {PROMPT_END_MARKER}")
+
+    prompt = body.strip()
+    if not prompt:
+        raise PromptUnavailableError(f"{path} contains an empty prompt block")
+
+    return prompt
 
 #: Openings of the prompt templates Open WebUI sends for its own bookkeeping calls
 #: (chat title, tag, search-query and emoji generation). Taken from
