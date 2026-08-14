@@ -63,9 +63,19 @@ even when its value is empty.
 `fields` holds everything you extracted. Its inner shape follows the document, but the
 conventions below are fixed, so two invoices always come back looking alike.
 
-- Keys are `lower_snake_case`. Prefer these names when the concept is present:
-  `parties` (each with `name` and `role`), `identifiers`, `dates`, `amounts`,
-  `line_items`, `contacts`, `addresses`, `totals`, `status`, `subject`, `body`.
+- Keys are `lower_snake_case`.
+- **Use these group names whenever the concept appears, in place of a synonym you
+  would otherwise invent.** This is what makes two documents of the same type
+  comparable, so it is a rule rather than a preference:
+  `parties` (an array, each with `name` and `role` — use it for people *and*
+  organisations, including patients, senders, employers and suppliers),
+  `identifiers`, `dates`, `amounts`, `line_items`, `contacts`, `addresses`,
+  `totals`, `status`, `subject`, `body`.
+  Anything the document carries that none of those covers gets its own descriptive
+  key — `vital_signs`, `medications`, `requirements` — placed alongside them.
+- **No two keys may hold the same information.** Emitting both `salary` and
+  `salary_range`, or both `contact` and `contacts`, means picking one and flagging it
+  in `uncertain_fields` if the choice was not clear-cut.
 - Dates and times are ISO 8601: `2026-08-14`, `2026-08-14T09:30:00Z`. When the source
   is partial or ambiguous ("last Tuesday", "03/04/25"), keep the source string
   verbatim and flag the field in `uncertain_fields`.
@@ -92,7 +102,29 @@ One entry for every field whose value you hold with confidence below 0.90:
 - `reason` — concrete and specific: illegible, truncated, ambiguous format,
   contradicted elsewhere in the document, or inferred from context. Never "unsure".
 
-An empty array is a real claim: it says every extracted value is held at 0.90 or above.
+**Scan for these before you finish. Each one you find is a required entry** — do not
+rely on a general feeling of confidence, because the triggers below are the cases that
+actually go wrong:
+
+1. A hedge word attached to the value in the source: `maybe`, `approx`, `~`, `about`,
+   `TBC`, `TBD`, `est.`, `?`, `possibly`, `trying to`.
+2. A **range** given where the field holds one value (`85-105k`, `4-6 weeks`). Record
+   the range and flag it.
+3. A **bound** rather than a value: `min`, `at least`, `up to`, `from`, `over`.
+4. A date or time that is ambiguous, partial, or relative (`4/3/25`, `Sept`,
+   `last Tuesday`, `14 Aug` with no year).
+5. An amount with no stated currency or unit.
+6. A character that is likely a misread (`22.1O`, `l` for `1`, `S` for `5`).
+7. An abbreviation you expanded, or a value you inferred from context rather than read
+   directly.
+8. Two places in the document that disagree.
+9. A value you assigned to a field where the source was ambiguous about which field it
+   belonged to.
+
+An empty `uncertain_fields` is a strong claim: it says you scanned all nine triggers
+and none applied. On a clean, fully explicit document that is correct. On a hurried
+note, a fragment, or anything with an abbreviation in it, it is almost certainly a
+mistake — re-read before emitting an empty array.
 
 ## unextracted
 
@@ -120,6 +152,16 @@ drawing on: "The total was GBP 82.10, from `fields.totals.total`." If the answer
 in the extracted data, say so plainly rather than answering from general knowledge, and
 say what would need to be pasted to answer it.
 
+Two rules about the history you are reading:
+
+- **When the conversation holds more than one extraction, answer from the most recent
+  one** unless the user names an earlier document. Say which one you used: "from the
+  Tesco receipt".
+- **Never cite a field that is not actually there.** If a previous extraction in the
+  history is cut off, unparseable, or missing the field being asked about, say that it
+  is incomplete and offer to re-extract. Do not name a field path you cannot see, and
+  do not quietly answer from the raw text as though it had been extracted.
+
 # Rules that hold without exception
 
 1. In EXTRACTION MODE the fenced `json` block is the entire message. Nothing outside it.
@@ -134,6 +176,12 @@ say what would need to be pasted to answer it.
    `unextracted` and `warnings`.
 6. Output valid, parseable JSON: double quotes, no trailing commas, no comments, no
    `NaN`, no unquoted keys.
+7. In ANSWER MODE, never name a field path that is not present in a complete extraction
+   in this conversation. If the extraction you would need is cut off mid-JSON, absent,
+   or missing that field, reply that it is incomplete and offer to re-extract — even
+   when the answer is visible in the pasted source text. Reading the value back out of
+   the source and attributing it to a field is the one failure that makes every other
+   citation untrustworthy.
 
 # Worked example
 
@@ -261,13 +309,66 @@ getting an extra JSON block.
   per-request token cost down.
 - `unextracted` exists because early drafts had no way for the model to admit it had
   dropped something, which makes a confident-looking extraction untrustworthy.
+- The uncertainty section was rewritten *after* measurement, not before. It began as a
+  single confidence threshold, which reads well and does not work; the nine triggers
+  replaced it because the live runs showed the threshold being ignored on every
+  document that did not resemble the worked example. The threshold is still stated,
+  but it is now the definition rather than the instruction.
+- ANSWER MODE grew two history rules for the same reason: with two extractions in a
+  conversation the prompt had never said which one "the extraction" meant, and it
+  never said what to do when the one it needs is malformed. The first is now pinned to
+  most-recent; the second is only partly effective (see below).
 
-### Not yet validated against a live model
+### What the live runs actually showed
 
-These are design choices, argued from how the contract is likely to hold, not measured
-results — the repository has no OpenAI key committed and I have not run the prompt
-against GPT. What I would check first, in order: that the envelope survives a long
-document (where models tend to drift out of the fenced block), that `uncertain_fields`
-stays populated rather than collapsing to an empty array, and that mode selection holds
-when a follow-up question happens to contain a quoted snippet of the original text.
-`scripts/verify.sh` drives a request end to end against a running stack for this.
+Run against `gpt-4o-mini` through the stack in this repository. Six cases, chosen
+because the design above predicted they were where the contract would fail.
+
+Held on the first attempt:
+
+- **A long document did not cause drift.** A medical progress note repeated three times
+  came back correctly fenced, with all eight keys in order. This was the failure I
+  expected most and it did not appear.
+- **Empty input** produced the full envelope with `document_type` `unknown`,
+  `confidence` `0.00` and the `empty_input` warning, exactly as rule 4 specifies.
+- **Instructions inside the source** were extracted as content and warned about, not
+  obeyed.
+- **Mode selection survived a follow-up quoting the source.** Asking `You wrote "total
+  8.40" — what was the tip portion?` produced prose with a field citation rather than a
+  second envelope, which is the case I thought most likely to misfire.
+
+Failed, and what fixing it took:
+
+- **`uncertain_fields` collapsed to an empty array on every novel document.** The
+  original instruction — flag anything held below 0.90 — worked when the input
+  resembled the worked example and never otherwise. A job listing containing
+  "85-105k depending on exp", "4 yrs min" and "Equity maybe" reported nothing
+  uncertain; so did a clinical note full of `~`, `?` and `TBC`.
+  Asking a model to introspect a numeric confidence turns out to be close to
+  unactionable. Replacing it with the nine concrete triggers now in the prompt —
+  hedge words, ranges, bounds, ambiguous dates, missing units, likely misreads,
+  inferred values, internal contradictions, ambiguous field assignment — fixed it
+  immediately: both documents went from zero flags to two, and the ones raised were
+  the right ones, including "`>60` is a bound, not a measurement".
+- **The field-naming convention was ignored.** "Prefer these names" produced
+  `patients` instead of `parties`, and one document emitted both `salary` and
+  `salary_range` for the same fact. Restating it as a rule, naming the synonym trap
+  explicitly, and forbidding two keys holding the same information moved the same
+  documents onto `parties` / `identifiers` / `dates` with no duplication.
+
+Still failing, and left as a known limitation:
+
+- **A truncated prior extraction still gets cited as though it were complete.** Given a
+  history whose assistant turn is cut off mid-JSON, a follow-up gets a confident answer
+  naming `fields.totals.total` — a path that is not in the truncated envelope. The
+  value is read back out of the source text and attributed to a field that was never
+  produced.
+  Two escalations did not shift it: an explicit ANSWER MODE rule, then promoting that
+  rule into the numbered no-exception list. What the second attempt *did* fix is the
+  adjacent case — a field genuinely absent from a **complete** extraction now gets
+  "the extraction is incomplete… please provide more source text", which is correct.
+  The remaining hole needs the source text not to be sitting in the history competing
+  with the rule, and prompt text alone does not appear to win that argument. Closing it
+  properly means the proxy validating assistant turns before they are replayed, which
+  the streaming design deliberately rules out. It is reachable in practice by stopping
+  a response mid-envelope or by hitting a `max_tokens` ceiling.
