@@ -6,7 +6,9 @@ selector from, and the completion it sends every turn to.
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Request, Response
@@ -14,7 +16,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from extractor_proxy.errors import error_envelope
 from extractor_proxy.prompt import inject_system_prompt
-from extractor_proxy.upstream import JSON_MEDIA_TYPE, UpstreamClient, UpstreamError
+from extractor_proxy.upstream import (
+    JSON_MEDIA_TYPE,
+    UpstreamClient,
+    UpstreamError,
+    UpstreamResponse,
+)
 
 logger = logging.getLogger("extractor_proxy.openai")
 
@@ -57,9 +64,32 @@ async def chat_completions(request: Request) -> Response:
     """
     state = request.app.state
 
+    declared_length = request.headers.get("content-length")
+    limit = state.settings.max_request_bytes
+    if declared_length and declared_length.isdigit() and int(declared_length) > limit:
+        logger.warning(
+            "chat.rejected",
+            extra={"reason": "body_too_large", "content_length": int(declared_length)},
+        )
+        return _error(
+            413,
+            f"Request body is larger than the {limit} byte limit.",
+            "invalid_request_error",
+        )
+
+    body = await request.body()
+    if len(body) > limit:
+        # A chunked request declares no length, so the read is checked too.
+        logger.warning("chat.rejected", extra={"reason": "body_too_large", "body_bytes": len(body)})
+        return _error(
+            413,
+            f"Request body is larger than the {limit} byte limit.",
+            "invalid_request_error",
+        )
+
     try:
-        payload = await request.json()
-    except ValueError:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return _error(400, "Request body is not valid JSON.", "invalid_request_error")
 
     if not isinstance(payload, dict):
@@ -76,9 +106,26 @@ async def chat_completions(request: Request) -> Response:
         )
 
     injected = inject_system_prompt(payload, state.system_prompt)
+    streaming = bool(injected.get("stream"))
+
+    # One line describing the request as the proxy understood it. Without this, a log
+    # stream shows a POST and an upstream status but not which model was asked, whether
+    # the prompt was injected, or how much history came with it — the three things that
+    # explain most surprising answers.
+    logger.info(
+        "chat.request",
+        extra={
+            "model": payload.get("model"),
+            "streaming": streaming,
+            "request_bytes": len(body),
+            "message_count": len(payload.get("messages") or []),
+            "prompt_injected": injected is not payload,
+        },
+    )
+
     client: UpstreamClient = state.upstream
 
-    if injected.get("stream"):
+    if streaming:
         return await _streaming_response(client, injected)
 
     try:
@@ -86,10 +133,40 @@ async def chat_completions(request: Request) -> Response:
     except UpstreamError as exc:
         return JSONResponse(exc.payload, status_code=exc.status_code)
 
+    _log_completion_usage(result)
+
     # Relayed verbatim rather than re-serialised, so key order and number formatting
     # survive the hop exactly as OpenAI sent them.
     return Response(
         content=result.content, status_code=result.status_code, media_type=JSON_MEDIA_TYPE
+    )
+
+
+def _log_completion_usage(result: UpstreamResponse) -> None:
+    """Record token usage and finish reason from a non-streaming completion.
+
+    Read-only: the bytes still go back verbatim. Truncation is the failure that looks
+    like a model quirk rather than a bug — `finish_reason: "length"` produces a
+    half-written envelope that then poisons every later turn in the conversation — so
+    it is worth a log line even though the proxy does not otherwise read the body.
+    """
+    if result.status_code >= 400:
+        return
+    try:
+        parsed = json.loads(result.content)
+        usage = parsed.get("usage") or {}
+        finish_reason = (parsed.get("choices") or [{}])[0].get("finish_reason")
+    except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+        return
+
+    logger.info(
+        "chat.completed",
+        extra={
+            "finish_reason": finish_reason,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "truncated": finish_reason == "length",
+        },
     )
 
 
@@ -113,14 +190,33 @@ async def _streaming_response(client: UpstreamClient, payload: dict[str, Any]) -
         await stream.aclose()
         return JSONResponse(exc.payload, status_code=exc.status_code)
 
+    started = time.perf_counter()
+
     async def body(primed: bytes | None) -> AsyncIterator[bytes]:
         # Taken as a parameter so it can be released after being yielded; a captured
         # closure variable would hold the buffer for the whole life of the stream.
-        if primed is not None:
-            yield primed
-            primed = None
-        async for chunk in stream:
-            yield chunk
+        chunks = 0
+        forwarded = 0
+        try:
+            if primed is not None:
+                chunks, forwarded = 1, len(primed)
+                yield primed
+                primed = None
+            async for chunk in stream:
+                chunks += 1
+                forwarded += len(chunk)
+                yield chunk
+        finally:
+            # In a `finally` so the summary survives a client disconnect, which is the
+            # case where knowing how far the stream got actually matters.
+            logger.info(
+                "chat.stream.finished",
+                extra={
+                    "chunks": chunks,
+                    "forwarded_bytes": forwarded,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                },
+            )
 
     return StreamingResponse(
         body(first_chunk), media_type="text/event-stream", headers=SSE_HEADERS

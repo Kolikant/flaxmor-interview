@@ -398,3 +398,87 @@ def test_models_list_is_empty_when_nothing_is_configured():
 
     # verify.sh treats this as an operational failure; the endpoint itself stays valid.
     assert body == {"object": "list", "data": []}
+
+
+# --- logging and limits ------------------------------------------------------
+
+
+def test_an_oversized_declared_body_is_rejected_before_it_is_read():
+    handler, seen = recording_handler()
+    app = build_app(handler, max_request_bytes=100)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=b"x" * 500,
+            headers={"content-type": "application/json", "content-length": "500"},
+        )
+
+    assert response.status_code == 413
+    assert seen == []
+
+
+def test_a_body_within_the_limit_still_works():
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION), max_request_bytes=100_000)
+
+    with TestClient(app) as client:
+        assert client.post("/v1/chat/completions", json=user_turn()).status_code == 200
+
+
+def test_an_error_response_carries_the_request_id_that_indexes_the_logs():
+    # "The browser showed me an error" becomes one grep without this.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with TestClient(build_app(handler)) as client:
+        response = client.post("/v1/chat/completions", json=user_turn())
+
+    assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
+
+
+def test_the_request_is_summarised_in_one_log_line(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.openai")
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION))
+
+    with TestClient(app) as client:
+        client.post("/v1/chat/completions", json=user_turn())
+
+    request_line = log_events(caplog)["chat.request"]
+    assert request_line.model == "gpt-4o-mini"
+    assert request_line.streaming is False
+    assert request_line.message_count == 1
+    assert request_line.prompt_injected is True
+
+
+def test_a_truncated_completion_is_flagged_in_the_logs(caplog):
+    # finish_reason "length" yields a half-written envelope that then poisons every
+    # later turn, and looks like a model quirk rather than a bug.
+    caplog.set_level(logging.INFO, logger="extractor_proxy.openai")
+    truncated = {
+        "choices": [{"index": 0, "finish_reason": "length", "message": {"content": '{"a'}}],
+        "usage": {"prompt_tokens": 1900, "completion_tokens": 16},
+    }
+    app = build_app(lambda r: httpx.Response(200, json=truncated))
+
+    with TestClient(app) as client:
+        client.post("/v1/chat/completions", json=user_turn())
+
+    completed = log_events(caplog)["chat.completed"]
+    assert completed.truncated is True
+    assert completed.prompt_tokens == 1900
+
+
+def test_a_stream_reports_how_far_it_got(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.openai")
+    app = build_app(
+        lambda r: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse(*STREAM_CHUNKS)
+        )
+    )
+
+    with TestClient(app) as client:
+        client.post("/v1/chat/completions", json=user_turn(stream=True))
+
+    finished = log_events(caplog)["chat.stream.finished"]
+    assert finished.chunks == len(STREAM_CHUNKS)
+    assert finished.forwarded_bytes == sum(len(c) for c in STREAM_CHUNKS)

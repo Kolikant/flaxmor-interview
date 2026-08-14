@@ -33,6 +33,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     Only a client created here is closed here. An injected one belongs to whoever
     built it, who may well outlive this app or share the client with another.
     """
+    logger.info("service.starting", extra=app.state.settings.redacted_summary())
+
     owns_client = app.state.upstream is None
     if owns_client:
         app.state.upstream = UpstreamClient(app.state.settings)
@@ -42,6 +44,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if owns_client:
             await app.state.upstream.aclose()
             app.state.upstream = None
+        logger.info("service.stopped")
 
 
 def create_app(settings: Settings | None = None, upstream: UpstreamClient | None = None) -> FastAPI:
