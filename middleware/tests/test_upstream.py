@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -208,3 +209,93 @@ async def test_connect_and_read_timeouts_are_configured_separately():
     assert timeout.connect == 3.5
     assert timeout.read == 45.0
     await client.aclose()
+
+
+# --- terminator guarantees found by the code-review pass ---------------------
+
+
+async def test_a_stream_ending_without_done_gets_a_terminator_appended():
+    # A 2xx SSE body that stops without [DONE] — a connection closed cleanly
+    # mid-envelope — would otherwise leave the client waiting on a stream that is
+    # never coming back.
+    client = build_client(
+        lambda request: httpx.Response(200, content=sse(b'data: {"choices":[]}\n\n'))
+    )
+
+    received = [chunk async for chunk in client.stream_chat_completion(PAYLOAD)]
+
+    assert received[-1] == b"data: [DONE]\n\n"
+    error = json.loads(received[-2].removeprefix(b"data: "))
+    assert error["error"]["type"] == "upstream_stream_interrupted"
+
+
+async def test_a_well_formed_stream_gets_no_extra_terminator():
+    chunks = [b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"]
+    client = build_client(lambda request: httpx.Response(200, content=sse(*chunks)))
+
+    received = [chunk async for chunk in client.stream_chat_completion(PAYLOAD)]
+
+    assert received == chunks
+
+
+async def test_an_empty_success_body_raises_before_any_byte_is_sent():
+    # Nothing has been sent, so the status line is still ours — a real 502 beats a 200
+    # carrying an in-band error.
+    client = build_client(lambda request: httpx.Response(200, content=sse()))
+
+    with pytest.raises(UpstreamError) as caught:
+        await anext(client.stream_chat_completion(PAYLOAD))
+
+    assert caught.value.status_code == 502
+    assert caught.value.payload["error"]["type"] == "upstream_empty_stream"
+
+
+async def test_a_streaming_error_body_that_is_not_openai_shaped_still_raises_cleanly():
+    # _relayable_body relays any JSON object verbatim, so a gateway answering
+    # {"detail": ...} used to raise KeyError inside the generator — which is not an
+    # UpstreamError, so the route could not catch it and the client got a bare 500.
+    client = build_client(lambda request: httpx.Response(502, json={"detail": "bad gateway"}))
+
+    with pytest.raises(UpstreamError) as caught:
+        await anext(client.stream_chat_completion(PAYLOAD))
+
+    assert caught.value.status_code == 502
+    assert caught.value.payload == {"detail": "bad gateway"}
+
+
+async def test_an_error_body_that_is_a_json_string_does_not_crash():
+    client = build_client(lambda request: httpx.Response(500, json={"error": "plain string"}))
+
+    with pytest.raises(UpstreamError) as caught:
+        await anext(client.stream_chat_completion(PAYLOAD))
+
+    assert caught.value.status_code == 500
+
+
+async def test_a_non_object_body_becomes_a_502_rather_than_relaying_the_status():
+    # A corporate proxy's HTML page arriving as 200 must not reach the client as a 200
+    # whose body is an error envelope; relaying the status is only honest while the
+    # bytes are also the upstream's.
+    client = build_client(lambda request: httpx.Response(200, text="<html>captive portal</html>"))
+
+    response = await client.chat_completion(PAYLOAD)
+
+    assert response.status_code == 502
+    assert json.loads(response.content)["error"]["type"] == "upstream_error"
+
+
+async def test_a_cancelled_consumer_is_logged_like_an_abandoned_stream(caplog):
+    # Starlette cancels the body-writer task on client disconnect, so a real stop
+    # arrives as CancelledError. Catching only GeneratorExit meant this never fired
+    # outside tests that called aclose() by hand.
+    caplog.set_level(logging.INFO, logger="extractor_proxy.upstream")
+    client = build_client(
+        lambda request: httpx.Response(200, content=sse(b"data: one\n\n", b"data: two\n\n"))
+    )
+    stream = client.stream_chat_completion(PAYLOAD)
+    assert await anext(stream) == b"data: one\n\n"
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.athrow(asyncio.CancelledError())
+
+    assert log_events(caplog)["upstream.stream.abandoned"].reason == "consumer_disconnected"

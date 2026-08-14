@@ -7,6 +7,7 @@ that happens after the response status has already been sent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -21,6 +22,16 @@ logger = logging.getLogger("extractor_proxy.upstream")
 
 #: Terminator every OpenAI-compatible SSE stream ends with. Open WebUI waits for it.
 SSE_DONE = b"data: [DONE]\n\n"
+SSE_DONE_MARKER = b"[DONE]"
+
+
+def _sse_error(message: str) -> bytes:
+    """An error object framed as one SSE event.
+
+    Open WebUI's frontend special-cases a `data:` frame carrying an `error` key, so
+    this reaches the user as a message rather than a silent truncation.
+    """
+    return b"data: " + error_body(message, "upstream_stream_interrupted") + b"\n\n"
 
 JSON_MEDIA_TYPE = "application/json"
 
@@ -36,7 +47,14 @@ class UpstreamError(Exception):
     """
 
     def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
-        super().__init__(payload["error"]["message"])
+        # Read defensively: an upstream error body is relayed verbatim whenever it is a
+        # JSON object, and a gateway can answer `{"detail": ...}` or even
+        # `{"error": "a string"}`. Subscripting would raise inside the streaming
+        # generator, where it is not an UpstreamError and so escapes the route's
+        # handler as a bare 500.
+        error = payload.get("error")
+        message = error.get("message") if isinstance(error, dict) else error
+        super().__init__(str(message) if message else f"upstream returned {status_code}")
         self.status_code = status_code
         self.payload = payload
 
@@ -74,14 +92,18 @@ def _transport_failure(exc: httpx.RequestError) -> UpstreamError:
     return error
 
 
-def _relayable_body(response: httpx.Response) -> bytes:
-    """The bytes to hand back to the client.
+def _relayable_body(response: httpx.Response) -> tuple[bytes, int]:
+    """The bytes and status to hand back to the client.
 
-    A JSON body — success or error — is relayed verbatim, so key order and number
-    formatting survive the hop untouched; a proxy that re-serialises is not really a
-    passthrough. Only a non-JSON body gets replaced, because a gateway in front of
-    OpenAI can answer with HTML and a client expecting the OpenAI error shape should
-    not have to cope with that.
+    A JSON object — success or error — is relayed verbatim with its own status, so key
+    order and number formatting survive the hop untouched; a proxy that re-serialises
+    is not really a passthrough.
+
+    Anything else is replaced with an error envelope, because a gateway in front of
+    OpenAI can answer with an HTML page and a client expecting the OpenAI error shape
+    should not have to cope with that. The status becomes 502 in that case: relaying
+    the upstream status is only honest while the bytes are also the upstream's, and a
+    proxy error page arriving as `200` with an error envelope is the worst of both.
     """
     try:
         parsed = json.loads(response.content)
@@ -89,22 +111,24 @@ def _relayable_body(response: httpx.Response) -> bytes:
         parsed = None
 
     if isinstance(parsed, dict):
-        return response.content
+        return response.content, response.status_code
 
     # Slice before decoding: `response.text` would decode and cache the whole body to
     # keep a fragment of it, which is the one place a hostile upstream makes this
     # proxy allocate in proportion to its response.
     excerpt = response.content[:_MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace")
-    return error_body(
-        f"Upstream returned a non-JSON body: {excerpt}",
+    body = error_body(
+        f"Upstream returned a body that is not a JSON object: {excerpt}",
         "upstream_error",
         code=str(response.status_code),
     )
+    return body, 502
 
 
 def _error_payload(response: httpx.Response) -> dict[str, Any]:
     """An upstream error as a dict, for the streaming path's raise-before-first-byte."""
-    return json.loads(_relayable_body(response))
+    body, _ = _relayable_body(response)
+    return json.loads(body)
 
 
 class UpstreamClient:
@@ -152,10 +176,9 @@ class UpstreamClient:
         except httpx.RequestError as exc:
             raise _transport_failure(exc) from exc
 
-        logger.info("upstream.response", extra={"status": response.status_code, "streamed": False})
-        return UpstreamResponse(
-            status_code=response.status_code, content=_relayable_body(response)
-        )
+        content, status_code = _relayable_body(response)
+        logger.info("upstream.response", extra={"status": status_code, "streamed": False})
+        return UpstreamResponse(status_code=status_code, content=content)
 
     async def stream_chat_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
         """Relay an SSE stream from OpenAI, chunk for chunk.
@@ -169,8 +192,14 @@ class UpstreamClient:
         status. After it, the status is already committed, so emit one error event
         and the `[DONE]` terminator — Open WebUI then shows a message instead of a
         silently truncated one.
+
+        The terminator is guaranteed on every path that sent bytes. A 2xx body that
+        ends without `[DONE]` — an empty body, a JSON or HTML page from something that
+        is not OpenAI, a connection closed cleanly mid-envelope — would otherwise leave
+        the client waiting on a stream that is never coming back.
         """
         sent_any = False
+        saw_done = False
         try:
             async with self.http_client.stream(
                 "POST", self._chat_url, json=payload, headers=self._headers
@@ -189,12 +218,28 @@ class UpstreamClient:
                 )
                 async for chunk in response.aiter_bytes():
                     sent_any = True
+                    # A substring check on opaque bytes, not SSE parsing: enough to
+                    # know the stream terminated itself, without decoding frames.
+                    saw_done = saw_done or SSE_DONE_MARKER in chunk
                     yield chunk
-        except GeneratorExit:
-            # Purely observational. The `async with` above already releases the
-            # upstream response when this propagates; this only names the upstream-side
-            # effect of a consumer stopping early — Open WebUI's stop button, or a
-            # closed tab — which the HTTP middleware cannot see from where it sits.
+
+                if not sent_any:
+                    # Nothing was sent, so the status line is still ours to choose.
+                    logger.warning("upstream.stream.empty", extra={"status": response.status_code})
+                    raise UpstreamError(
+                        502,
+                        error_envelope(
+                            "Upstream returned a success status with an empty body.",
+                            "upstream_empty_stream",
+                        ),
+                    )
+        except (GeneratorExit, asyncio.CancelledError):
+            # A consumer stopped early: Open WebUI's stop button, or a closed tab.
+            # Starlette cancels the body-writer task on disconnect, which arrives here
+            # as CancelledError — GeneratorExit only shows up for an explicit aclose().
+            # Catching just the latter meant this never fired for a real disconnect.
+            # The `async with` releases the upstream response either way; this names
+            # the upstream-side effect, which the HTTP middleware cannot see.
             logger.info("upstream.stream.abandoned", extra={"reason": "consumer_disconnected"})
             raise
         except httpx.RequestError as exc:
@@ -202,8 +247,11 @@ class UpstreamClient:
                 raise _transport_failure(exc) from exc
 
             logger.warning("upstream.stream.interrupted", extra={"reason": type(exc).__name__})
-            yield b"data: " + error_body(
-                f"The upstream response was interrupted: {exc}",
-                "upstream_stream_interrupted",
-            ) + b"\n\n"
+            yield _sse_error(f"The upstream response was interrupted: {exc}")
+            yield SSE_DONE
+            return
+
+        if not saw_done:
+            logger.warning("upstream.stream.unterminated", extra={"sent_any": sent_any})
+            yield _sse_error("The upstream response ended without a terminator.")
             yield SSE_DONE
