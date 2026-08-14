@@ -10,6 +10,7 @@ from extractor_proxy import __version__
 from extractor_proxy.config import Settings, get_settings
 from extractor_proxy.observability import RequestLifecycleMiddleware
 from extractor_proxy.prompt import PromptUnavailableError, load_system_prompt
+from extractor_proxy.routes import health
 
 logger = logging.getLogger("extractor_proxy")
 
@@ -32,6 +33,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.system_prompt, app.state.system_prompt_error = _read_prompt(settings)
+    app.include_router(health.router)
     app.add_middleware(RequestLifecycleMiddleware)
     return app
 
