@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -164,6 +165,80 @@ def test_streamed_responses_are_measured_to_the_last_chunk(caplog):
     # The whole streamed body is accounted for, not just the first chunk — the
     # reason this middleware wraps `send` instead of using BaseHTTPMiddleware.
     assert end.response_bytes == len("onetwothree")
+
+
+async def drive_middleware(inner) -> list[dict]:
+    """Run the lifecycle middleware around `inner` with a bare ASGI harness.
+
+    A cancelled request cannot be provoked through TestClient, so the middleware is
+    exercised directly at the ASGI boundary.
+    """
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/stream",
+        "headers": [],
+        "query_string": b"",
+    }
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await RequestLifecycleMiddleware(inner)(scope, receive, send)
+    return sent
+
+
+async def test_a_cancelled_request_still_closes_the_lifecycle(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.http")
+
+    async def cancelled_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+        raise asyncio.CancelledError
+
+    # CancelledError is a BaseException on 3.11, so an `except Exception` arm cannot
+    # see it. Without a terminal event here the request looks open forever.
+    with pytest.raises(asyncio.CancelledError):
+        await drive_middleware(cancelled_app)
+
+    logged = events(caplog)
+    assert "http.request.cancelled" in logged
+    assert logged["http.request.cancelled"].status == 200
+    assert logged["http.request.cancelled"].response_bytes == len(b"partial")
+
+
+async def test_a_stream_abandoned_without_a_final_chunk_is_still_closed(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.http")
+
+    async def disconnected_app(scope, receive, send):
+        # Starlette cancels the body writer on client disconnect and returns
+        # normally, so the final more_body=False message never arrives.
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+
+    await drive_middleware(disconnected_app)
+
+    logged = events(caplog)
+    assert "http.request.end" not in logged
+    assert logged["http.request.cancelled"].response_bytes == len(b"chunk")
+
+
+async def test_a_completed_request_is_not_reported_as_cancelled(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.http")
+
+    async def complete_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"done", "more_body": False})
+
+    await drive_middleware(complete_app)
+
+    logged = events(caplog)
+    assert "http.request.end" in logged
+    assert "http.request.cancelled" not in logged
 
 
 def test_a_failing_handler_still_closes_the_lifecycle(caplog):

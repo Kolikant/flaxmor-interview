@@ -147,6 +147,7 @@ class RequestLifecycleMiddleware:
         path = scope.get("path", "")
         status: int | None = None
         body_bytes = 0
+        closed = False
 
         def elapsed_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
@@ -157,7 +158,7 @@ class RequestLifecycleMiddleware:
         )
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status, body_bytes
+            nonlocal status, body_bytes, closed
 
             if message["type"] == "http.response.start":
                 status = message["status"]
@@ -174,6 +175,7 @@ class RequestLifecycleMiddleware:
             elif message["type"] == "http.response.body":
                 body_bytes += len(message.get("body", b"") or b"")
                 if not message.get("more_body", False):
+                    closed = True
                     self.logger.info(
                         "http.request.end",
                         extra={
@@ -192,10 +194,28 @@ class RequestLifecycleMiddleware:
         except Exception:
             # Logged here so a crash still produces a lifecycle-closing line with the
             # request id attached; the exception continues up to the ASGI server.
+            closed = True
             self.logger.exception(
                 "http.request.failed",
                 extra={"method": method, "path": path, "duration_ms": elapsed_ms()},
             )
             raise
         finally:
+            if not closed:
+                # Every request gets a terminal line, including the two cases neither
+                # arm above can see. A client that disconnects mid-stream never
+                # produces a final body message, because Starlette cancels the body
+                # writer and returns normally; and asyncio.CancelledError is a
+                # BaseException, so `except Exception` cannot catch it. Without this,
+                # pressing stop leaves a request that looks open forever.
+                self.logger.warning(
+                    "http.request.cancelled",
+                    extra={
+                        "method": method,
+                        "path": path,
+                        "status": status,
+                        "duration_ms": elapsed_ms(),
+                        "response_bytes": body_bytes,
+                    },
+                )
             request_id_var.reset(token)
