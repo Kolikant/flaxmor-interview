@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project-specific -------------------------------------------------------
+
+# Assignment brief supplied by Flaxmor — kept local, it is not part of the deliverable
+assignment*.txt
+assignment*.md
+assignment*.pdf
+
+# Local env overrides beyond the plain .env above, keeping the checked-in template
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
