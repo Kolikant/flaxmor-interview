@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from extractor_proxy import config
 from extractor_proxy.config import (
     PROMPT_FILENAME,
     Settings,
@@ -52,3 +53,49 @@ def test_system_prompt_path_points_at_the_repo_document():
 
 def test_get_settings_is_cached():
     assert get_settings() is get_settings()
+
+
+def test_the_walk_stops_at_the_repository_root(tmp_path, monkeypatch):
+    # An unrelated SYSTEM_PROMPT.md above the checkout must not become the prompt this
+    # service runs, so the search stops at the repo boundary rather than at "/".
+    #
+    # The decoy goes in a directory that is NOT the working directory: the fixture
+    # chdirs to tmp_path, and the not-found fallback is cwd-relative, so a decoy placed
+    # in tmp_path itself would be returned by the fallback and the assertion would pass
+    # or fail for the wrong reason.
+    above = tmp_path / "above"
+    repo = above / "repo"
+    package = repo / "middleware" / "src" / "extractor_proxy"
+    package.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    decoy = above / "SYSTEM_PROMPT.md"
+    decoy.write_text("not ours", encoding="utf-8")
+    monkeypatch.setattr(config, "__file__", str(package / "config.py"))
+
+    assert config.discover_system_prompt_path() != decoy
+
+
+def test_the_document_is_found_at_the_repository_root(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    package = repo / "middleware" / "src" / "extractor_proxy"
+    package.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    document = repo / "SYSTEM_PROMPT.md"
+    document.write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(config, "__file__", str(package / "config.py"))
+
+    assert config.discover_system_prompt_path() == document
+
+
+def test_the_fallback_is_absolute_so_the_error_names_a_real_path(tmp_path, monkeypatch):
+    # A cwd-relative fallback produced "cannot read prompt document at
+    # SYSTEM_PROMPT.md", which gives an operator nothing to act on.
+    package = tmp_path / "nowhere" / "extractor_proxy"
+    package.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(config, "__file__", str(package / "config.py"))
+
+    fallback = config.discover_system_prompt_path()
+
+    assert fallback.is_absolute()
+    assert fallback.name == PROMPT_FILENAME
