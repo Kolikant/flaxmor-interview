@@ -19,8 +19,23 @@
 
 set -uo pipefail
 
-MIDDLEWARE_URL="${MIDDLEWARE_URL:-http://localhost:8000}"
-OPEN_WEBUI_URL="${OPEN_WEBUI_URL:-http://localhost:3000}"
+# Ports are read from .env when it sets them, so that changing MIDDLEWARE_PORT — the
+# documented remedy for a host port clash — does not make this script report a healthy
+# stack as "not running". Read with grep rather than sourced, so .env cannot execute.
+env_port() {
+    if [ -n "${2-}" ]; then printf '%s' "$2"; return; fi
+    if [ -f .env ]; then
+        value=$(grep -E "^$1=" .env | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')
+        if [ -n "$value" ]; then printf '%s' "$value"; return; fi
+    fi
+    printf '%s' "$3"
+}
+
+MIDDLEWARE_PORT=$(env_port MIDDLEWARE_PORT "${MIDDLEWARE_PORT-}" 8000)
+OPEN_WEBUI_PORT=$(env_port OPEN_WEBUI_PORT "${OPEN_WEBUI_PORT-}" 3000)
+
+MIDDLEWARE_URL="${MIDDLEWARE_URL:-http://localhost:$MIDDLEWARE_PORT}"
+OPEN_WEBUI_URL="${OPEN_WEBUI_URL:-http://localhost:$OPEN_WEBUI_PORT}"
 VERIFY_MODEL="${VERIFY_MODEL:-gpt-4o-mini}"
 
 if [ -t 1 ]; then
@@ -39,6 +54,27 @@ begin() { step=$((step + 1)); printf '\n%s[%d] %s%s\n' "$BOLD" "$step" "$1" "$RE
 
 # Reads a JSON value from stdin without needing jq installed.
 jsonq() { python3 -c "import json, sys; $1"; }
+
+# Turns a non-200 from the middleware into the right message and exit code. Shared by
+# every check that makes a completion, so none of them can pass on a failed request.
+classify_failure() {
+  cf_status=$1; cf_body=$2; cf_what=$3
+  cf_type=$(printf '%s' "$cf_body" | jsonq 'print(json.load(sys.stdin).get("error",{}).get("type",""))' 2>/dev/null)
+  cf_msg=$(printf '%s' "$cf_body" | jsonq 'print(json.load(sys.stdin).get("error",{}).get("message",""))' 2>/dev/null)
+  case "$cf_type" in
+    insufficient_quota|rate_limit_error|invalid_request_error)
+      printf '  %s!%s The proxy reached OpenAI and OpenAI refused.\n' "$YELLOW" "$RESET"
+      info "$cf_status $cf_type: $cf_msg"
+      info "The chain itself is wired correctly — this is an account or key problem."
+      exit 3 ;;
+    upstream_unavailable|upstream_timeout|upstream_empty_stream)
+      die "the middleware could not reach OpenAI ($cf_type): $cf_msg" ;;
+    prompt_unavailable)
+      die "SYSTEM_PROMPT.md did not load inside the container: $cf_msg" ;;
+    *)
+      die "unexpected $cf_status from $cf_what: ${cf_msg:-$cf_body}" ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 begin "Middleware liveness — is the process up"
@@ -99,23 +135,7 @@ response=$(curl -sS --max-time 120 -w '\n%{http_code}' \
 status=$(printf '%s' "$response" | tail -n1)
 body=$(printf '%s' "$response" | sed '$d')
 
-if [ "$status" != "200" ]; then
-  err_type=$(printf '%s' "$body" | jsonq 'print(json.load(sys.stdin).get("error",{}).get("type",""))' 2>/dev/null)
-  err_msg=$(printf '%s' "$body" | jsonq 'print(json.load(sys.stdin).get("error",{}).get("message",""))' 2>/dev/null)
-  case "$err_type" in
-    insufficient_quota|rate_limit_error|invalid_request_error)
-      printf '  %s!%s The proxy reached OpenAI and OpenAI refused.\n' "$YELLOW" "$RESET"
-      info "$status $err_type: $err_msg"
-      info "The chain itself is wired correctly — this is an account or key problem."
-      exit 3 ;;
-    upstream_unavailable|upstream_timeout)
-      die "the middleware could not reach OpenAI ($err_type): $err_msg" ;;
-    prompt_unavailable)
-      die "SYSTEM_PROMPT.md did not load inside the container: $err_msg" ;;
-    *)
-      die "unexpected $status from /v1/chat/completions: ${err_msg:-$body}" ;;
-  esac
-fi
+[ "$status" = "200" ] || classify_failure "$status" "$body" "the extraction request"
 
 envelope_report=$(printf '%s' "$body" | python3 -c '
 import json, sys
@@ -143,7 +163,7 @@ flagged = len(env["uncertain_fields"])
 warnings = len(env["warnings"])
 print(f"fenced={fenced} type={doc_type} confidence={confidence}")
 print(f"uncertain_fields={flagged} warnings={warnings}")
-') || die "$envelope_report"
+' 2>&1) || die "$envelope_report"
 ok "all eight envelope keys present, in order"
 printf '%s\n' "$envelope_report" | while IFS= read -r line; do info "$line"; done
 
@@ -155,8 +175,12 @@ import json, sys
 payload = json.load(sys.stdin); payload["stream"] = True
 print(json.dumps(payload))')
 
-stream_out=$(curl -sS -N --max-time 120 "$MIDDLEWARE_URL/v1/chat/completions" \
+stream_response=$(curl -sS -N --max-time 120 -w '\n%{http_code}' \
+  "$MIDDLEWARE_URL/v1/chat/completions" \
   -H 'content-type: application/json' -d "$stream_request")
+stream_status=$(printf '%s' "$stream_response" | tail -n1)
+stream_out=$(printf '%s' "$stream_response" | sed '$d')
+[ "$stream_status" = "200" ] || classify_failure "$stream_status" "$stream_out" "the streaming request"
 events=$(printf '%s\n' "$stream_out" | grep -c '^data: ' || true)
 [ "$events" -gt 1 ] || die "expected many SSE events, saw $events — the response was not streamed"
 printf '%s\n' "$stream_out" | grep -q 'data: \[DONE\]' \
@@ -173,14 +197,26 @@ begin "Prompt injection is scoped — Open WebUI's own calls are left alone"
 # injected into these, every chat in the sidebar would be named with a JSON envelope.
 task_request=$(VERIFY_MODEL="$VERIFY_MODEL" python3 -c '
 import json, os
+# Faithful to DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE in open-webui 0.6.5, including
+# the "### Output:" section — the proxy requires both signals before treating a message
+# as Open WebUI bookkeeping, so an abridged copy here would not exercise the real path.
+# (No apostrophes in this block: it sits inside a single-quoted python -c argument.)
 template = ("### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing "
-            "the chat history.\n\n### Chat History:\nUSER: here is my invoice for 82.10")
+            "the chat history.\n### Output:\nJSON format: { \"title\": \"your concise "
+            "title here\" }\n### Chat History:\nUSER: here is my invoice for 82.10")
 print(json.dumps({"model": os.environ["VERIFY_MODEL"], "stream": False,
                   "messages": [{"role": "user", "content": template}]}))')
 
-title=$(curl -sS --max-time 60 "$MIDDLEWARE_URL/v1/chat/completions" \
-  -H 'content-type: application/json' -d "$task_request" \
-  | jsonq 'print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+task_response=$(curl -sS --max-time 60 -w '\n%{http_code}' \
+  "$MIDDLEWARE_URL/v1/chat/completions" \
+  -H 'content-type: application/json' -d "$task_request")
+task_status=$(printf '%s' "$task_response" | tail -n1)
+task_body=$(printf '%s' "$task_response" | sed '$d')
+[ "$task_status" = "200" ] || classify_failure "$task_status" "$task_body" "the title request"
+title=$(printf '%s' "$task_body" | jsonq 'print(json.load(sys.stdin)["choices"][0]["message"]["content"])' 2>/dev/null)
+# Without this, an empty title would not match the envelope pattern below and the check
+# would print its tick having proved nothing.
+[ -n "$title" ] || die "the title request returned no content; nothing was proved here"
 
 case "$title" in
   *document_type*) die "a title request came back as an extraction envelope — internal-task detection is not working" ;;

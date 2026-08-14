@@ -140,3 +140,20 @@ def test_the_uncertain_field_example_shows_the_documented_shape():
 
     assert len(entries) == 1
     assert list(entries[0]) == ["path", "confidence", "reason"]
+
+
+def test_the_verify_script_pins_the_same_envelope_contract():
+    """scripts/verify.sh carries its own copy of the key list; keep them in step.
+
+    The script is the only check that runs against a live model, and nothing in the
+    suite reads it — so a contract change made here and missed there would leave the
+    script reporting "envelope key order drifted" and pointing the blame at the model.
+    """
+    script = discover_system_prompt_path().parent / "scripts" / "verify.sh"
+    if not script.is_file():
+        pytest.skip("scripts/verify.sh is not present next to the document")
+
+    quoted = re.search(r"KEYS = \[(.*?)\]", script.read_text(encoding="utf-8"), flags=re.DOTALL)
+
+    assert quoted, "verify.sh should declare a KEYS list"
+    assert re.findall(r'"([a-z_]+)"', quoted.group(1)) == ENVELOPE_KEYS
