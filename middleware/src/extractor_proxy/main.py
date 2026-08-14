@@ -71,12 +71,12 @@ def _read_prompt(settings: Settings) -> tuple[str | None, str | None]:
     try:
         prompt = load_system_prompt(settings.system_prompt_path)
     except PromptUnavailableError as exc:
-        logger.error("prompt.load.failed", extra={"path": str(settings.system_prompt_path)})
+        logger.error("prompt.load.failed", extra={"prompt_path": str(settings.system_prompt_path)})
         return None, str(exc)
 
     logger.info(
         "prompt.load.ok",
-        extra={"path": str(settings.system_prompt_path), "prompt_chars": len(prompt)},
+        extra={"prompt_path": str(settings.system_prompt_path), "prompt_chars": len(prompt)},
     )
     return prompt, None
 

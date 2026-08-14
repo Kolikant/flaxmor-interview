@@ -23,6 +23,10 @@ def main() -> None:
         # Uvicorn would otherwise install its own dictConfig and undo the JSON
         # handler set above.
         log_config=None,
+        # RequestLifecycleMiddleware already logs every request with the status,
+        # timing, byte count and request id. Uvicorn's access log would repeat a
+        # subset of that on a second line per request.
+        access_log=False,
     )
 
 
