@@ -39,7 +39,11 @@ services:
       EXPOSED_MODELS: ${EXPOSED_MODELS:-gpt-4o-mini}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
-      - "${MIDDLEWARE_PORT:-8000}:8000"
+      # Bound to loopback deliberately. This service holds the real OpenAI key and has
+      # no inbound authentication — a decision that is only defensible while it is
+      # unreachable from the network. Published on 0.0.0.0 it would let anyone on the
+      # LAN spend the key with a model of their choosing.
+      - "127.0.0.1:${MIDDLEWARE_PORT:-8000}:8000"
     healthcheck:
       # python:3.11-slim ships neither curl nor wget, and a healthcheck naming a
       # missing binary leaves the container permanently unhealthy — which would wedge
@@ -90,7 +94,9 @@ services:
       # otherwise, which invalidates every existing token.
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-local-dev-secret-change-me}
     ports:
-      - "${OPEN_WEBUI_PORT:-3000}:8080"
+      # Loopback for the same reason: its session-signing key defaults to a literal
+      # published in this repository.
+      - "127.0.0.1:${OPEN_WEBUI_PORT:-3000}:8080"
     volumes:
       - open-webui-data:/app/backend/data
     healthcheck:
