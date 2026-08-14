@@ -64,8 +64,9 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-89 tests, no network access — the OpenAI upstream is faked with `httpx2.MockTransport`,
-including the streams that fail halfway through.
+115 tests, no network access — the OpenAI upstream is faked with `httpx2.MockTransport`,
+including the streams that fail halfway through, end without a terminator, or are
+abandoned by a cancelled consumer.
 
 ### Useful commands
 
@@ -118,10 +119,21 @@ extraction contract turns every chat title in the sidebar into an extraction env
 Open WebUI does label these calls — `metadata.task` in the request body — but its OpenAI
 router runs `metadata = payload.pop("metadata", None)` **before** forwarding upstream, so
 the label never reaches a proxy standing where this one stands. Detection has to match
-the prompt template text instead: a lone user message beginning `### Task:` (or the
-emoji template's opening). Deliberately narrow, so pasting a document that mentions
-`### Task:` further down is still treated as a real turn. Check 6 of `verify.sh` is the
-live proof this works.
+the prompt template text instead, and the exact shape of that match matters in both
+directions:
+
+- **A final user message, optionally preceded only by system messages.** Requiring
+  exactly one message looked tighter and was wrong: giving a workspace model a system
+  prompt makes Open WebUI prepend it to every request, task calls included, so detection
+  would have stopped working the moment a user configured a model.
+- **Two signals, not one.** The five templates opening `### Task:` all also carry an
+  `### Output:` section, and both are required — otherwise a person pasting a to-do list
+  that starts "### Task:" would silently get no extraction at all. The three templates
+  with no shared header (emoji, MoA, tool-calling) are matched on openings distinctive
+  enough to stand alone.
+
+All eight of 0.6.5's default templates are covered, read out of the pinned image rather
+than transcribed. Check 6 of `verify.sh` is the live proof this still works.
 
 ### Streaming failures are reported differently before and after the first byte
 
@@ -132,9 +144,16 @@ still gets a real HTTP status and an OpenAI-shaped error body. It costs no laten
 because the chunk is forwarded as soon as it arrives.
 
 After the first byte the only channel left is the stream itself, so the proxy emits one
-`data:` event carrying an error object and then `data: [DONE]`. Open WebUI shows a
-message rather than a silently truncated one. The cost is that a mid-stream failure is
-an HTTP `200`; the log line and the error event are the signal.
+`data:` event carrying an error object and then `data: [DONE]`. Open WebUI's frontend
+special-cases a frame carrying an `error` key, so this reaches the user as a message
+rather than a silent truncation. The cost is that a mid-stream failure is an HTTP `200`;
+the log line and the error event are the signal.
+
+The terminator is guaranteed on every path that sent bytes, including a 2xx body that
+simply stops — a connection closed cleanly mid-envelope, or something that is not
+OpenAI answering with a JSON or HTML page. Without that a client waits on a stream that
+is never coming back. A 2xx with an *empty* body is caught before anything is sent, so
+it becomes a real `502` rather than a hanging `200`.
 
 ### Chunks are forwarded as opaque bytes
 
@@ -215,9 +234,15 @@ already taken by a local install.
 
 Not oversights; each is a decision.
 
-- **No authentication on the proxy.** It is bound to a local stack and the real key
-  lives in its own environment, so a string comparison against a dummy bearer token
-  would buy nothing.
+- **No authentication on the proxy.** Both published ports are bound to `127.0.0.1`,
+  so the service is unreachable from the network and a string comparison against a
+  dummy bearer token would buy nothing. The loopback binding is what makes that true —
+  published on `0.0.0.0` this would let anyone on the LAN spend the key with a model of
+  their choosing, so the two decisions travel together.
+- **No request body size limit.** A pasted document is legitimately large and the
+  service is loopback-only, so the body is read whole. A 6MB paste relays OpenAI's own
+  `context_length_exceeded` with container memory flat; the exposure is a local process
+  sending a deliberately huge body.
 - **No retries or circuit breaking.** Retrying a completion risks double-billing, a
   streamed request cannot be replayed once bytes have shipped, and a silently retrying
   proxy makes its own latency logs lie. Upstream `429`s and `5xx`s pass through and the
@@ -250,6 +275,15 @@ Not oversights; each is a decision.
   rather than the document. Paste the text to exercise the extractor.
 - **`OPENAI_API_BASE_URL` must not end in a slash.** Open WebUI builds calls as
   `f"{url}/models"`, so a trailing slash produces `//models` and a 404.
+- **An admin-customised task template defeats injection scoping.** Detection matches the
+  template text of Open WebUI 0.6.5, because Open WebUI strips its own `metadata.task`
+  label before forwarding. All eight of that version's default templates are covered,
+  but editing one in Admin → Interface, or bumping the image, can silently reintroduce
+  extraction envelopes as chat titles. Check 6 of `verify.sh` is what catches it.
+- **A source document can corrupt values while keeping the envelope intact.** A pasted
+  "PARSER DIRECTIVE" claiming a different unit or telling the model to clear its
+  uncertainty flags is answered with a rule in the prompt and a warning, but nothing
+  downstream validates the numbers — that is the cost of not parsing the response.
 
 ---
 
