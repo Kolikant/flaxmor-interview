@@ -7,10 +7,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from extractor_proxy import __version__
 from extractor_proxy.config import Settings, get_settings
+from extractor_proxy.errors import error_envelope
 from extractor_proxy.observability import RequestLifecycleMiddleware
 from extractor_proxy.prompt import PromptUnavailableError, load_system_prompt
 from extractor_proxy.routes import health, openai_compat
@@ -38,6 +41,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if owns_client:
             await app.state.upstream.aclose()
+            app.state.upstream = None
 
 
 def create_app(settings: Settings | None = None, upstream: UpstreamClient | None = None) -> FastAPI:
@@ -64,7 +68,35 @@ def create_app(settings: Settings | None = None, upstream: UpstreamClient | None
     app.include_router(health.router)
     app.include_router(openai_compat.router)
     app.add_middleware(RequestLifecycleMiddleware)
+    _install_error_handlers(app)
     return app
+
+
+def _install_error_handlers(app: FastAPI) -> None:
+    """Answer framework-level errors in the same shape as everything else.
+
+    Without these, a wrong path gives Starlette's `{"detail": "Not Found"}` and an
+    unhandled exception gives bare text, so a client that learned to read
+    `error.message` from every other failure suddenly cannot. Open WebUI in particular
+    pulls its toast text straight out of `error.message`.
+    """
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        return JSONResponse(
+            error_envelope(str(exc.detail), "invalid_request_error", code=str(exc.status_code)),
+            status_code=exc.status_code,
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        # The lifecycle middleware has already logged this with the request id; the
+        # exception type is deliberately not echoed to the client.
+        return JSONResponse(
+            error_envelope("The proxy failed to handle this request.", "internal_error"),
+            status_code=500,
+        )
 
 
 def _models_payload(settings: Settings) -> dict[str, Any]:

@@ -248,3 +248,17 @@ def test_a_failing_handler_still_closes_the_lifecycle(caplog):
     failure = events(caplog)["http.request.failed"]
     assert failure.path == "/boom"
     assert failure.exc_info is not None
+
+
+async def test_a_non_http_scope_is_passed_through_untouched(caplog):
+    caplog.set_level(logging.INFO, logger="extractor_proxy.http")
+    seen = {}
+
+    async def inner(scope, receive, send):
+        seen["scope"] = scope
+
+    scope = {"type": "lifespan"}
+    await RequestLifecycleMiddleware(inner)(scope, None, None)
+
+    assert seen["scope"] is scope
+    assert caplog.records == []

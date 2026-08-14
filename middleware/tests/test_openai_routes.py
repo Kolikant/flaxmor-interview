@@ -18,8 +18,11 @@ COMPLETION = {
     "choices": [{"index": 0, "message": {"role": "assistant", "content": '{"a": 1}'}}],
 }
 
+# Faithful to the real 0.6.5 template, "### Output:" section included — the proxy
+# requires both signals before treating a message as Open WebUI bookkeeping.
 TITLE_TEMPLATE = (
-    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history."
+    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat "
+    'history.\n### Output:\nJSON format: { "title": "your concise title here" }'
 )
 
 
@@ -322,3 +325,76 @@ def test_the_upstream_outcome_is_logged(caplog):
     logged = log_events(caplog)
     assert logged["upstream.response"].status == 200
     assert logged["upstream.response"].streamed is False
+
+
+# --- shapes found by the code-review pass -----------------------------------
+
+
+def test_a_messages_list_holding_non_objects_is_not_a_500():
+    # Four reviewers found this independently: `{"messages": ["hi"]}` used to reach
+    # prompt injection, raise AttributeError, and answer 500 with a stack trace.
+    handler, seen = recording_handler()
+
+    with TestClient(build_app(handler)) as client:
+        response = client.post(
+            "/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": ["hi"]}
+        )
+
+    # Forwarded so OpenAI answers with its own validation error, per the pass-through
+    # rule for malformed message lists — the one thing it must not be is a 500.
+    assert response.status_code != 500
+    assert seen[0]["messages"] == ["hi"]
+
+
+def test_an_unknown_path_answers_in_the_error_envelope():
+    # Every other failure gives {"error": {...}}; Starlette's default {"detail": ...}
+    # would make a client that learned to read error.message fail here alone.
+    with TestClient(build_app(recording_handler()[0])) as client:
+        response = client.get("/v1/nonexistent")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["message"]
+
+
+def test_a_wrong_method_answers_in_the_error_envelope():
+    with TestClient(build_app(recording_handler()[0])) as client:
+        response = client.get("/v1/chat/completions")
+
+    assert response.status_code == 405
+    assert response.json()["error"]["message"]
+
+
+def test_a_stream_without_a_terminator_is_terminated_for_the_client():
+    app = build_app(
+        lambda r: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse(b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=user_turn(stream=True))
+
+    assert response.status_code == 200
+    assert response.content.rstrip().endswith(b"data: [DONE]")
+
+
+def test_an_empty_upstream_stream_becomes_a_502_not_a_hanging_200():
+    app = build_app(lambda r: httpx.Response(200, content=sse()))
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=user_turn(stream=True))
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_empty_stream"
+
+
+def test_models_list_is_empty_when_nothing_is_configured():
+    app = build_app(recording_handler()[0], exposed_models="")
+
+    with TestClient(app) as client:
+        body = client.get("/v1/models").json()
+
+    # verify.sh treats this as an operational failure; the endpoint itself stays valid.
+    assert body == {"object": "list", "data": []}
