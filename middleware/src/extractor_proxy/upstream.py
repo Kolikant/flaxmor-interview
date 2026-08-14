@@ -15,22 +15,16 @@ from typing import Any, AsyncIterator
 import httpx2 as httpx
 
 from extractor_proxy.config import Settings
+from extractor_proxy.errors import error_body, error_envelope
 
 logger = logging.getLogger("extractor_proxy.upstream")
 
 #: Terminator every OpenAI-compatible SSE stream ends with. Open WebUI waits for it.
 SSE_DONE = b"data: [DONE]\n\n"
 
-_MAX_ERROR_BODY_CHARS = 500
+JSON_MEDIA_TYPE = "application/json"
 
-
-def error_envelope(message: str, error_type: str, code: str | None = None) -> dict[str, Any]:
-    """Build an OpenAI-shaped error body.
-
-    Clients of an OpenAI-compatible API already know how to read this shape, so
-    failures originating in the proxy are dressed the same way as upstream ones.
-    """
-    return {"error": {"message": message, "type": error_type, "code": code}}
+_MAX_ERROR_BODY_BYTES = 500
 
 
 class UpstreamError(Exception):
@@ -49,50 +43,68 @@ class UpstreamError(Exception):
 
 @dataclass(frozen=True)
 class UpstreamResponse:
-    """An upstream HTTP response, successful or not, ready to relay verbatim."""
+    """An upstream response, ready to relay without being re-encoded."""
 
     status_code: int
-    payload: dict[str, Any]
+    content: bytes
 
 
 def _transport_failure(exc: httpx.RequestError) -> UpstreamError:
-    """Map an httpx transport failure onto a gateway status."""
+    """Map an httpx transport failure onto a gateway status, and log it.
+
+    Logging happens here rather than at the call sites because both the streaming and
+    non-streaming paths need the identical line, and the mapping is what knows the
+    status and reason it should carry.
+    """
     if isinstance(exc, httpx.TimeoutException):
-        return UpstreamError(
+        error = UpstreamError(
             504,
-            error_envelope(
-                f"Upstream request to OpenAI timed out: {exc}",
-                "upstream_timeout",
-            ),
+            error_envelope(f"Upstream request to OpenAI timed out: {exc}", "upstream_timeout"),
         )
-    return UpstreamError(
-        502,
-        error_envelope(
-            f"Could not reach OpenAI: {exc}",
-            "upstream_unavailable",
-        ),
+    else:
+        error = UpstreamError(
+            502,
+            error_envelope(f"Could not reach OpenAI: {exc}", "upstream_unavailable"),
+        )
+
+    logger.warning(
+        "upstream.request.failed",
+        extra={"status": error.status_code, "reason": error.payload["error"]["type"]},
     )
+    return error
 
 
-def _decode_body(response: httpx.Response) -> dict[str, Any]:
-    """Parse an upstream body, synthesising an envelope when it is not JSON.
+def _relayable_body(response: httpx.Response) -> bytes:
+    """The bytes to hand back to the client.
 
-    A gateway in front of OpenAI can answer with HTML, and a client expecting the
-    OpenAI error shape should not have to cope with that.
+    A JSON body — success or error — is relayed verbatim, so key order and number
+    formatting survive the hop untouched; a proxy that re-serialises is not really a
+    passthrough. Only a non-JSON body gets replaced, because a gateway in front of
+    OpenAI can answer with HTML and a client expecting the OpenAI error shape should
+    not have to cope with that.
     """
     try:
-        payload = response.json()
-    except (json.JSONDecodeError, ValueError):
-        payload = None
+        parsed = json.loads(response.content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        parsed = None
 
-    if isinstance(payload, dict):
-        return payload
+    if isinstance(parsed, dict):
+        return response.content
 
-    return error_envelope(
-        f"Upstream returned a non-JSON body: {response.text[:_MAX_ERROR_BODY_CHARS]}",
+    # Slice before decoding: `response.text` would decode and cache the whole body to
+    # keep a fragment of it, which is the one place a hostile upstream makes this
+    # proxy allocate in proportion to its response.
+    excerpt = response.content[:_MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace")
+    return error_body(
+        f"Upstream returned a non-JSON body: {excerpt}",
         "upstream_error",
         code=str(response.status_code),
     )
+
+
+def _error_payload(response: httpx.Response) -> dict[str, Any]:
+    """An upstream error as a dict, for the streaming path's raise-before-first-byte."""
+    return json.loads(_relayable_body(response))
 
 
 class UpstreamClient:
@@ -109,28 +121,22 @@ class UpstreamClient:
             )
         )
 
-    async def aclose(self) -> None:
-        await self.http_client.aclose()
-
-    @property
-    def _chat_url(self) -> str:
-        return f"{self._settings.openai_base_url}/chat/completions"
-
-    def _headers(self) -> dict[str, str]:
-        """Authenticate with the configured key only.
-
-        Whatever the caller sent is ignored: Open WebUI is configured with a dummy
-        key, so forwarding it would hand OpenAI a bogus credential, and trusting it
-        would make the real key client-supplied.
-        """
-        return {
-            "authorization": f"Bearer {self._settings.openai_api_key}",
-            "content-type": "application/json",
+        # Both are fixed for the client's lifetime, so they are built once here rather
+        # than per request. The key is the configured one and nothing else: Open WebUI
+        # holds a dummy, so forwarding what the caller sent would hand OpenAI a bogus
+        # credential, and trusting it would make the real key client-supplied.
+        self._chat_url = f"{settings.openai_base_url}/chat/completions"
+        self._headers = {
+            "authorization": f"Bearer {settings.openai_api_key}",
+            "content-type": JSON_MEDIA_TYPE,
             # Ask for an unencoded body. httpx decodes transparently but leaves the
             # original content-encoding on the response, so an encoded upstream reply
             # invites a header that no longer describes the bytes being relayed.
             "accept-encoding": "identity",
         }
+
+    async def aclose(self) -> None:
+        await self.http_client.aclose()
 
     async def chat_completion(self, payload: dict[str, Any]) -> UpstreamResponse:
         """Send a non-streaming completion and relay whatever came back.
@@ -141,21 +147,15 @@ class UpstreamClient:
         """
         try:
             response = await self.http_client.post(
-                self._chat_url, json=payload, headers=self._headers()
+                self._chat_url, json=payload, headers=self._headers
             )
         except httpx.RequestError as exc:
-            error = _transport_failure(exc)
-            logger.warning(
-                "upstream.request.failed",
-                extra={"status": error.status_code, "reason": error.payload["error"]["type"]},
-            )
-            raise error from exc
+            raise _transport_failure(exc) from exc
 
-        logger.info(
-            "upstream.response",
-            extra={"status": response.status_code, "streamed": False},
+        logger.info("upstream.response", extra={"status": response.status_code, "streamed": False})
+        return UpstreamResponse(
+            status_code=response.status_code, content=_relayable_body(response)
         )
-        return UpstreamResponse(status_code=response.status_code, payload=_decode_body(response))
 
     async def stream_chat_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
         """Relay an SSE stream from OpenAI, chunk for chunk.
@@ -173,7 +173,7 @@ class UpstreamClient:
         sent_any = False
         try:
             async with self.http_client.stream(
-                "POST", self._chat_url, json=payload, headers=self._headers()
+                "POST", self._chat_url, json=payload, headers=self._headers
             ) as response:
                 if response.status_code >= 400:
                     await response.aread()
@@ -181,38 +181,29 @@ class UpstreamClient:
                         "upstream.response",
                         extra={"status": response.status_code, "streamed": True},
                     )
-                    raise UpstreamError(response.status_code, _decode_body(response))
+                    raise UpstreamError(response.status_code, _error_payload(response))
 
                 logger.info(
                     "upstream.response",
                     extra={"status": response.status_code, "streamed": True},
                 )
-                try:
-                    async for chunk in response.aiter_bytes():
-                        sent_any = True
-                        yield chunk
-                except GeneratorExit:
-                    # The consumer stopped early — Open WebUI's stop button, or a
-                    # closed browser tab. Exiting the context manager releases the
-                    # upstream response instead of leaving the call in flight.
-                    logger.info(
-                        "upstream.stream.abandoned",
-                        extra={"reason": "consumer_disconnected"},
-                    )
-                    raise
+                async for chunk in response.aiter_bytes():
+                    sent_any = True
+                    yield chunk
+        except GeneratorExit:
+            # Purely observational. The `async with` above already releases the
+            # upstream response when this propagates; this only names the upstream-side
+            # effect of a consumer stopping early — Open WebUI's stop button, or a
+            # closed tab — which the HTTP middleware cannot see from where it sits.
+            logger.info("upstream.stream.abandoned", extra={"reason": "consumer_disconnected"})
+            raise
         except httpx.RequestError as exc:
             if not sent_any:
-                error = _transport_failure(exc)
-                logger.warning(
-                    "upstream.request.failed",
-                    extra={"status": error.status_code, "reason": error.payload["error"]["type"]},
-                )
-                raise error from exc
+                raise _transport_failure(exc) from exc
 
             logger.warning("upstream.stream.interrupted", extra={"reason": type(exc).__name__})
-            interrupted = error_envelope(
+            yield b"data: " + error_body(
                 f"The upstream response was interrupted: {exc}",
                 "upstream_stream_interrupted",
-            )
-            yield f"data: {json.dumps(interrupted)}\n\n".encode()
+            ) + b"\n\n"
             yield SSE_DONE

@@ -16,7 +16,7 @@ router = APIRouter(tags=["operations"])
 
 
 @router.get("/healthz", summary="Liveness — is the process up")
-def liveness(request: Request) -> dict[str, Any]:
+async def liveness(request: Request) -> dict[str, Any]:
     """Always 200 while the process can serve a request.
 
     Deliberately dependency-free. A liveness probe that fails on a bad
@@ -31,7 +31,7 @@ def liveness(request: Request) -> dict[str, Any]:
 
 
 @router.get("/readyz", summary="Readiness — can this instance serve chat traffic")
-def readiness(request: Request, response: Response) -> dict[str, Any]:
+async def readiness(request: Request, response: Response) -> dict[str, Any]:
     """200 when the instance can serve chat traffic, 503 with the reason when not.
 
     Checks local preconditions only, and does not call OpenAI. Two reasons: a probe

@@ -6,6 +6,7 @@ import logging
 import httpx2 as httpx
 import pytest
 
+from conftest import DUMMY_API_KEY, log_events, sse
 from extractor_proxy.config import Settings
 from extractor_proxy.upstream import UpstreamClient, UpstreamError
 
@@ -19,25 +20,25 @@ COMPLETION = {
 
 
 def build_client(handler, **overrides) -> UpstreamClient:
-    settings = Settings(**{"openai_api_key": "sk-configured", **overrides})
+    settings = Settings(**{"openai_api_key": DUMMY_API_KEY, **overrides})
     return UpstreamClient(settings, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-
-
-async def sse(*chunks: bytes):
-    for chunk in chunks:
-        yield chunk
 
 
 # --- non-streaming ----------------------------------------------------------
 
 
-async def test_a_successful_completion_is_relayed_unchanged():
-    client = build_client(lambda request: httpx.Response(200, json=COMPLETION))
+async def test_a_successful_completion_is_relayed_byte_for_byte():
+    # Verbatim bytes, not a re-serialised dict: key order and number formatting have
+    # to survive the hop, or the proxy is not really a passthrough.
+    raw = b'{"id":"chatcmpl-1","zeta":1.50,"alpha":2,"choices":[]}'
+    client = build_client(
+        lambda request: httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+    )
 
     response = await client.chat_completion(PAYLOAD)
 
     assert response.status_code == 200
-    assert response.payload == COMPLETION
+    assert response.content == raw
 
 
 async def test_the_configured_key_authenticates_the_upstream_call():
@@ -50,7 +51,7 @@ async def test_the_configured_key_authenticates_the_upstream_call():
 
     await build_client(handler).chat_completion(PAYLOAD)
 
-    assert seen["authorization"] == "Bearer sk-configured"
+    assert seen["authorization"] == f"Bearer {DUMMY_API_KEY}"
     assert seen["url"] == "https://api.openai.com/v1/chat/completions"
 
 
@@ -97,7 +98,7 @@ async def test_an_upstream_error_response_keeps_its_status_and_body():
     response = await client.chat_completion(PAYLOAD)
 
     assert response.status_code == 429
-    assert response.payload == upstream_body
+    assert json.loads(response.content) == upstream_body
 
 
 async def test_a_non_json_upstream_failure_still_yields_an_error_envelope():
@@ -106,8 +107,9 @@ async def test_a_non_json_upstream_failure_still_yields_an_error_envelope():
     response = await client.chat_completion(PAYLOAD)
 
     assert response.status_code == 502
-    assert response.payload["error"]["type"] == "upstream_error"
-    assert "bad gateway" in response.payload["error"]["message"]
+    envelope = json.loads(response.content)
+    assert envelope["error"]["type"] == "upstream_error"
+    assert "bad gateway" in envelope["error"]["message"]
 
 
 # --- streaming --------------------------------------------------------------
@@ -171,7 +173,7 @@ async def test_a_mid_stream_failure_ends_the_stream_with_an_error_event():
     assert received[-1] == b"data: [DONE]\n\n"
 
 
-async def test_abandoning_the_stream_releases_the_upstream_response(caplog):
+async def test_abandoning_the_stream_logs_the_upstream_abandonment(caplog):
     caplog.set_level(logging.INFO, logger="extractor_proxy.upstream")
     client = build_client(
         lambda request: httpx.Response(200, content=sse(b"data: one\n\n", b"data: two\n\n"))
@@ -181,10 +183,10 @@ async def test_abandoning_the_stream_releases_the_upstream_response(caplog):
     assert await anext(stream) == b"data: one\n\n"
     await stream.aclose()
 
-    # A consumer that hits stop must not leave the upstream call in flight. Closing
-    # the generator exits the stream context manager, which releases the response.
-    events = {record.getMessage(): record for record in caplog.records}
-    assert events["upstream.stream.abandoned"].reason == "consumer_disconnected"
+    # Closing the generator makes the `async with` release the upstream response; the
+    # log line is the observable that a consumer stopped early, which is what the HTTP
+    # middleware cannot see from where it sits.
+    assert log_events(caplog)["upstream.stream.abandoned"].reason == "consumer_disconnected"
 
 
 # --- timeouts ---------------------------------------------------------------
@@ -195,7 +197,7 @@ async def test_connect_and_read_timeouts_are_configured_separately():
     # budget would kill a stream that is legitimately still producing tokens. Built
     # without an injected transport so the client constructs its own timeout.
     settings = Settings(
-        openai_api_key="sk-configured",
+        openai_api_key=DUMMY_API_KEY,
         connect_timeout_seconds=3.5,
         read_timeout_seconds=45.0,
     )

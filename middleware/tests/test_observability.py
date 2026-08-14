@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
+from conftest import log_events as events
 from extractor_proxy.observability import (
     JsonFormatter,
     RequestLifecycleMiddleware,
@@ -97,7 +98,7 @@ def test_non_serialisable_extras_do_not_break_the_line(json_logger):
     assert isinstance(entry["path_obj"], str)
 
 
-def build_app() -> FastAPI:
+def probe_app() -> FastAPI:
     app = FastAPI()
     app.add_middleware(RequestLifecycleMiddleware)
 
@@ -121,19 +122,15 @@ def build_app() -> FastAPI:
     return app
 
 
-def events(caplog) -> dict[str, logging.LogRecord]:
-    return {record.getMessage(): record for record in caplog.records}
-
-
 def test_response_carries_a_generated_request_id():
-    with TestClient(build_app()) as client:
+    with TestClient(probe_app()) as client:
         response = client.get("/ok")
 
     assert response.headers["x-request-id"]
 
 
 def test_inbound_request_id_is_reused_rather_than_replaced():
-    with TestClient(build_app()) as client:
+    with TestClient(probe_app()) as client:
         response = client.get("/ok", headers={"X-Request-ID": "trace-from-caller"})
 
     assert response.headers["x-request-id"] == "trace-from-caller"
@@ -142,7 +139,7 @@ def test_inbound_request_id_is_reused_rather_than_replaced():
 def test_lifecycle_logs_cover_start_first_byte_and_completion(caplog):
     caplog.set_level(logging.INFO, logger="extractor_proxy.http")
 
-    with TestClient(build_app()) as client:
+    with TestClient(probe_app()) as client:
         client.get("/ok")
 
     logged = events(caplog)
@@ -157,7 +154,7 @@ def test_lifecycle_logs_cover_start_first_byte_and_completion(caplog):
 def test_streamed_responses_are_measured_to_the_last_chunk(caplog):
     caplog.set_level(logging.INFO, logger="extractor_proxy.http")
 
-    with TestClient(build_app()) as client:
+    with TestClient(probe_app()) as client:
         response = client.get("/stream")
 
     assert response.text == "onetwothree"
@@ -244,7 +241,7 @@ async def test_a_completed_request_is_not_reported_as_cancelled(caplog):
 def test_a_failing_handler_still_closes_the_lifecycle(caplog):
     caplog.set_level(logging.INFO, logger="extractor_proxy.http")
 
-    with TestClient(build_app()) as client:
+    with TestClient(probe_app()) as client:
         with pytest.raises(RuntimeError, match="handler blew up"):
             client.get("/boom")
 

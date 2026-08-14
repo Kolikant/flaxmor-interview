@@ -6,16 +6,15 @@ selector from, and the completion it sends every turn to.
 
 from __future__ import annotations
 
-import json
 import logging
-import time
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from extractor_proxy.errors import error_envelope
 from extractor_proxy.prompt import inject_system_prompt
-from extractor_proxy.upstream import UpstreamClient, UpstreamError, error_envelope
+from extractor_proxy.upstream import JSON_MEDIA_TYPE, UpstreamClient, UpstreamError
 
 logger = logging.getLogger("extractor_proxy.openai")
 
@@ -28,31 +27,24 @@ router = APIRouter(prefix="/v1", tags=["openai"])
 SSE_HEADERS = {"cache-control": "no-store"}
 
 
-def _bad_request(message: str) -> JSONResponse:
-    return JSONResponse(error_envelope(message, "invalid_request_error"), status_code=400)
+def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
+    """An error this proxy originated, as opposed to one relayed from upstream."""
+    return JSONResponse(error_envelope(message, error_type), status_code=status_code)
 
 
 @router.get("/models", summary="Models advertised to Open WebUI")
 async def list_models(request: Request) -> dict[str, Any]:
-    """List the configured models without calling OpenAI.
+    """Return the configured models without calling OpenAI.
 
     Serving this from configuration keeps the selector populated when the upstream is
     unreachable, and keeps the endpoint deterministic under test. The tradeoff is that
     the list does not reflect the account's real entitlements, so a model the key
     cannot reach fails at the first chat rather than at selection.
 
-    `id` is load-bearing: Open WebUI subscripts it directly while merging model lists,
-    and a missing one discards the whole list rather than the one entry.
+    The payload is built once at startup, since it derives entirely from settings that
+    cannot change at runtime.
     """
-    settings = request.app.state.settings
-    created = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": created, "owned_by": "openai"}
-            for model_id in settings.exposed_model_ids
-        ],
-    }
+    return request.app.state.models_payload
 
 
 @router.post("/chat/completions", summary="Chat completion with the extraction prompt injected")
@@ -66,29 +58,27 @@ async def chat_completions(request: Request) -> Response:
     state = request.app.state
 
     try:
-        payload = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _bad_request("Request body is not valid JSON.")
+        payload = await request.json()
+    except ValueError:
+        return _error(400, "Request body is not valid JSON.", "invalid_request_error")
 
     if not isinstance(payload, dict):
-        return _bad_request("Request body must be a JSON object.")
+        return _error(400, "Request body must be a JSON object.", "invalid_request_error")
 
     if state.system_prompt is None:
         # Relaying without the prompt would quietly turn the product into a plain
         # GPT proxy, which is a worse failure than refusing.
         logger.error("chat.refused", extra={"reason": "prompt_unavailable"})
-        return JSONResponse(
-            error_envelope(
-                f"The extraction prompt is unavailable: {state.system_prompt_error}",
-                "prompt_unavailable",
-            ),
-            status_code=503,
+        return _error(
+            503,
+            f"The extraction prompt is unavailable: {state.system_prompt_error}",
+            "prompt_unavailable",
         )
 
     injected = inject_system_prompt(payload, state.system_prompt)
     client: UpstreamClient = state.upstream
 
-    if bool(injected.get("stream")):
+    if injected.get("stream"):
         return await _streaming_response(client, injected)
 
     try:
@@ -96,7 +86,11 @@ async def chat_completions(request: Request) -> Response:
     except UpstreamError as exc:
         return JSONResponse(exc.payload, status_code=exc.status_code)
 
-    return JSONResponse(result.payload, status_code=result.status_code)
+    # Relayed verbatim rather than re-serialised, so key order and number formatting
+    # survive the hop exactly as OpenAI sent them.
+    return Response(
+        content=result.content, status_code=result.status_code, media_type=JSON_MEDIA_TYPE
+    )
 
 
 async def _streaming_response(client: UpstreamClient, payload: dict[str, Any]) -> Response:
@@ -119,10 +113,15 @@ async def _streaming_response(client: UpstreamClient, payload: dict[str, Any]) -
         await stream.aclose()
         return JSONResponse(exc.payload, status_code=exc.status_code)
 
-    async def body() -> AsyncIterator[bytes]:
-        if first_chunk is not None:
-            yield first_chunk
+    async def body(primed: bytes | None) -> AsyncIterator[bytes]:
+        # Taken as a parameter so it can be released after being yielded; a captured
+        # closure variable would hold the buffer for the whole life of the stream.
+        if primed is not None:
+            yield primed
+            primed = None
         async for chunk in stream:
             yield chunk
 
-    return StreamingResponse(body(), media_type="text/event-stream", headers=SSE_HEADERS)
+    return StreamingResponse(
+        body(first_chunk), media_type="text/event-stream", headers=SSE_HEADERS
+    )

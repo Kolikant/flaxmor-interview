@@ -3,13 +3,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import DUMMY_API_KEY
 from extractor_proxy import __version__
 from extractor_proxy.config import Settings
 from extractor_proxy.main import create_app
 
 
 def client_for(**overrides) -> TestClient:
-    settings = Settings(**{"openai_api_key": "sk-test", **overrides})
+    settings = Settings(**{"openai_api_key": DUMMY_API_KEY, **overrides})
     return TestClient(create_app(settings))
 
 

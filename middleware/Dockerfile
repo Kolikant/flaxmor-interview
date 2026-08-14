@@ -9,18 +9,18 @@ FROM python:3.11-slim
 # problem a reviewer would hit.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-# Package metadata and sources are copied together because the project is installed
-# from pyproject.toml. This means a source edit re-resolves dependencies, which costs
-# a slower rebuild in exchange for having no second copy of the dependency list to
-# drift from the real one.
+# Metadata and sources are copied together because the project is installed from
+# pyproject.toml, so there is no second copy of the dependency list to drift from the
+# real one. The consequence is that editing a source file invalidates this layer — the
+# BuildKit cache mount is what stops that re-downloading all 34 packages every time,
+# so PIP_NO_CACHE_DIR is deliberately *not* set.
 COPY middleware/pyproject.toml /app/middleware/pyproject.toml
 COPY middleware/src /app/middleware/src
-RUN pip install /app/middleware
+RUN --mount=type=cache,target=/root/.cache/pip pip install /app/middleware
 
 # The prompt document is the runtime source of truth rather than a Python constant.
 # SYSTEM_PROMPT_PATH is set explicitly in compose so nothing depends on the loader's

@@ -7,6 +7,7 @@ import httpx2 as httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import DUMMY_API_KEY, log_events, sse
 from extractor_proxy.config import Settings
 from extractor_proxy.main import create_app
 from extractor_proxy.upstream import UpstreamClient
@@ -23,27 +24,22 @@ TITLE_TEMPLATE = (
 
 
 def build_app(handler, **overrides):
-    settings = Settings(**{"openai_api_key": "sk-configured", **overrides})
+    settings = Settings(**{"openai_api_key": DUMMY_API_KEY, **overrides})
     upstream = UpstreamClient(
         settings, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     return create_app(settings, upstream=upstream)
 
 
-def recording_handler(response_factory):
-    """A MockTransport handler that records the bodies it was sent."""
+def recording_handler(reply=None):
+    """A MockTransport handler that records the request bodies it was sent."""
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        return response_factory(request)
+        return httpx.Response(200, json=reply if reply is not None else COMPLETION)
 
     return handler, seen
-
-
-async def sse(*chunks: bytes):
-    for chunk in chunks:
-        yield chunk
 
 
 def user_turn(text="Invoice A-4491 total 82.10", **extra) -> dict:
@@ -79,7 +75,7 @@ def test_each_model_entry_carries_the_fields_open_webui_reads():
 
 
 def test_listing_models_never_calls_the_upstream():
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
     app = build_app(handler)
 
     with TestClient(app) as client:
@@ -93,7 +89,7 @@ def test_listing_models_never_calls_the_upstream():
 
 
 def test_the_extraction_prompt_reaches_the_upstream_first():
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
     app = build_app(handler)
 
     with TestClient(app) as client:
@@ -106,7 +102,7 @@ def test_the_extraction_prompt_reaches_the_upstream_first():
 
 
 def test_an_open_webui_task_request_passes_through_untouched():
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
     app = build_app(handler)
 
     with TestClient(app) as client:
@@ -140,7 +136,7 @@ def test_an_inbound_authorization_header_is_not_forwarded():
             headers={"Authorization": "Bearer sk-dummy-from-open-webui"},
         )
 
-    assert seen["authorization"] == "Bearer sk-configured"
+    assert seen["authorization"] == f"Bearer {DUMMY_API_KEY}"
 
 
 def test_an_upstream_error_status_is_relayed_with_its_body():
@@ -166,7 +162,7 @@ def test_an_unreachable_upstream_becomes_a_502():
 
 
 def test_a_malformed_request_body_is_rejected_before_the_upstream_is_called():
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
 
     with TestClient(build_app(handler)) as client:
         response = client.post(
@@ -184,7 +180,7 @@ def test_a_malformed_request_body_is_rejected_before_the_upstream_is_called():
 def test_a_json_body_that_is_not_an_object_is_rejected(body):
     # Valid JSON but not a dict: reaching prompt injection with this would raise an
     # AttributeError and surface as a 500 with a stack trace.
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
 
     with TestClient(build_app(handler)) as client:
         response = client.post(
@@ -291,7 +287,7 @@ def test_a_mid_stream_failure_is_reported_inside_the_stream():
 
 
 def test_chat_is_refused_when_the_prompt_document_is_unloadable(tmp_path):
-    handler, seen = recording_handler(lambda r: httpx.Response(200, json=COMPLETION))
+    handler, seen = recording_handler()
     app = build_app(handler, system_prompt_path=tmp_path / "absent.md")
 
     with TestClient(app) as client:
@@ -323,6 +319,6 @@ def test_the_upstream_outcome_is_logged(caplog):
         response = client.post("/v1/chat/completions", json=user_turn())
 
     assert response.headers["x-request-id"]
-    logged = {record.getMessage(): record for record in caplog.records}
+    logged = log_events(caplog)
     assert logged["upstream.response"].status == 200
     assert logged["upstream.response"].streamed is False

@@ -60,6 +60,10 @@ services:
     restart: unless-stopped
 
   open-webui:
+    # Pinned: OPEN_WEBUI_TASK_MARKERS in middleware/src/extractor_proxy/prompt.py is
+    # copied from this version's prompt templates. Re-check it on any bump and re-run
+    # scripts/verify.sh check 6 — if the templates change, the failure is silent and
+    # every chat title quietly becomes an extraction envelope.
     image: ghcr.io/open-webui/open-webui:0.6.5
     depends_on:
       postgres:

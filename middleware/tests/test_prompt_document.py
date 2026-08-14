@@ -19,6 +19,10 @@ from extractor_proxy.prompt import (
     load_system_prompt,
 )
 
+#: The envelope contract, written out rather than parsed from SYSTEM_PROMPT.md on
+#: purpose: deriving it from the document under test would make these assertions
+#: circular. This list is the independent statement of the contract, so a change to the
+#: document has to be made here too — which is the point.
 ENVELOPE_KEYS = [
     "document_type",
     "confidence",
@@ -103,16 +107,22 @@ def test_the_repository_prompt_names_every_envelope_key():
 
 
 def prompt_json_blocks() -> list[dict]:
-    prompt = repository_prompt()
-    blocks = re.findall(r"```json\n(.*?)```", prompt, flags=re.DOTALL)
-    assert blocks, "the prompt should contain at least one json example block"
-    # A typo in any example would actively teach the model to emit broken JSON, so
-    # every block in the prompt has to parse, not just the worked example.
+    """Every fenced json example in the prompt, parsed.
+
+    No assertions here: three tests call this, and a failure raised inside a shared
+    helper reports whichever test happened to run first rather than the real defect.
+    """
+    blocks = re.findall(r"```json\n(.*?)```", repository_prompt(), flags=re.DOTALL)
     return [json.loads(block) for block in blocks]
 
 
 def test_every_json_example_in_the_prompt_parses():
-    assert len(prompt_json_blocks()) >= 2
+    # A typo in any example would actively teach the model to emit broken JSON, so
+    # every block has to parse — not just the worked example. json.loads raising here
+    # is the assertion.
+    blocks = prompt_json_blocks()
+
+    assert len(blocks) >= 2
 
 
 def test_the_envelope_examples_carry_every_key_in_the_documented_order():

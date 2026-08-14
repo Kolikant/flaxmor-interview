@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
-from starlette.datastructures import MutableHeaders
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 REQUEST_ID_HEADER = "x-request-id"
@@ -22,33 +22,14 @@ request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 #: Attributes the stdlib puts on every LogRecord. Anything else on the record came
 #: from an `extra={...}` at the call site and is merged into the JSON payload.
+#:
+#: Derived from a throwaway record rather than hand-listed, so that an attribute added
+#: by a future Python release is excluded automatically instead of leaking into every
+#: log line as a spurious field. `asctime` and `message` are added because they are
+#: populated during formatting and so are absent from a fresh record.
 _STANDARD_RECORD_ATTRS = frozenset(
-    {
-        "args",
-        "asctime",
-        "created",
-        "exc_info",
-        "exc_text",
-        "filename",
-        "funcName",
-        "levelname",
-        "levelno",
-        "lineno",
-        "module",
-        "msecs",
-        "msg",
-        "message",
-        "name",
-        "pathname",
-        "process",
-        "processName",
-        "relativeCreated",
-        "stack_info",
-        "taskName",
-        "thread",
-        "threadName",
-    }
-)
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+) | {"asctime", "message"}
 
 
 class JsonFormatter(logging.Formatter):
@@ -96,7 +77,11 @@ def configure_logging(level: str = "INFO", service_name: str = "extractor-proxy"
     """Point the root logger at stdout with JSON formatting.
 
     Uvicorn's own loggers have their handlers removed so their output is reformatted
-    by the root handler instead of arriving as unstructured text alongside ours.
+    by the root handler instead of arriving as unstructured text alongside ours. That
+    loop is the belt to `log_config=None`'s braces in __main__: with no dictConfig
+    installed those loggers already propagate, but an invocation that bypasses the
+    entrypoint (`uvicorn --reload`) does install one.
+
     Called from the process entrypoint rather than the app factory, so importing the
     app in tests never mutates global logging state.
     """
@@ -114,10 +99,8 @@ def configure_logging(level: str = "INFO", service_name: str = "extractor-proxy"
 
 
 def _inbound_request_id(scope: Scope) -> str | None:
-    for raw_name, raw_value in scope.get("headers", []):
-        if raw_name.decode("latin-1").lower() == REQUEST_ID_HEADER:
-            return raw_value.decode("latin-1").strip() or None
-    return None
+    """Reuse a caller's trace id so it survives the hop into this service."""
+    return (Headers(scope=scope).get(REQUEST_ID_HEADER) or "").strip() or None
 
 
 class RequestLifecycleMiddleware:
@@ -147,10 +130,19 @@ class RequestLifecycleMiddleware:
         path = scope.get("path", "")
         status: int | None = None
         body_bytes = 0
-        closed = False
+        terminal_logged = False
 
         def elapsed_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
+
+        def terminal_fields() -> dict[str, object]:
+            return {
+                "method": method,
+                "path": path,
+                "status": status,
+                "duration_ms": elapsed_ms(),
+                "response_bytes": body_bytes,
+            }
 
         self.logger.info(
             "http.request.start",
@@ -158,11 +150,11 @@ class RequestLifecycleMiddleware:
         )
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal status, body_bytes, closed
+            nonlocal status, body_bytes, terminal_logged
 
             if message["type"] == "http.response.start":
                 status = message["status"]
-                MutableHeaders(scope=message).append("x-request-id", request_id)
+                MutableHeaders(scope=message).append(REQUEST_ID_HEADER, request_id)
                 self.logger.info(
                     "http.response.start",
                     extra={
@@ -175,17 +167,8 @@ class RequestLifecycleMiddleware:
             elif message["type"] == "http.response.body":
                 body_bytes += len(message.get("body", b"") or b"")
                 if not message.get("more_body", False):
-                    closed = True
-                    self.logger.info(
-                        "http.request.end",
-                        extra={
-                            "method": method,
-                            "path": path,
-                            "status": status,
-                            "duration_ms": elapsed_ms(),
-                            "response_bytes": body_bytes,
-                        },
-                    )
+                    terminal_logged = True
+                    self.logger.info("http.request.end", extra=terminal_fields())
 
             await send(message)
 
@@ -194,28 +177,19 @@ class RequestLifecycleMiddleware:
         except Exception:
             # Logged here so a crash still produces a lifecycle-closing line with the
             # request id attached; the exception continues up to the ASGI server.
-            closed = True
+            terminal_logged = True
             self.logger.exception(
                 "http.request.failed",
                 extra={"method": method, "path": path, "duration_ms": elapsed_ms()},
             )
             raise
         finally:
-            if not closed:
+            if not terminal_logged:
                 # Every request gets a terminal line, including the two cases neither
                 # arm above can see. A client that disconnects mid-stream never
                 # produces a final body message, because Starlette cancels the body
                 # writer and returns normally; and asyncio.CancelledError is a
                 # BaseException, so `except Exception` cannot catch it. Without this,
                 # pressing stop leaves a request that looks open forever.
-                self.logger.warning(
-                    "http.request.cancelled",
-                    extra={
-                        "method": method,
-                        "path": path,
-                        "status": status,
-                        "duration_ms": elapsed_ms(),
-                        "response_bytes": body_bytes,
-                    },
-                )
+                self.logger.warning("http.request.cancelled", extra=terminal_fields())
             request_id_var.reset(token)

@@ -12,18 +12,29 @@ PROMPT_FILENAME = "SYSTEM_PROMPT.md"
 
 
 def discover_system_prompt_path() -> Path:
-    """Locate SYSTEM_PROMPT.md by walking up from this module.
+    """Locate SYSTEM_PROMPT.md by walking up from this module, for a source checkout.
 
     The assignment requires the prompt to live in the repo as SYSTEM_PROMPT.md, so
     that file is treated as the single source of truth and loaded at startup rather
-    than duplicated into a Python constant that could drift from the document. The
-    container image copies it alongside the package root, which this walk also finds.
+    than duplicated into a Python constant that could drift from the document.
+
+    This walk serves local runs and the test suite only. It cannot work in the
+    container, where the package is installed into site-packages and no parent of it
+    is the repository — which is exactly why docker-compose.yml sets
+    SYSTEM_PROMPT_PATH explicitly.
+
+    The search stops at the repository root rather than continuing to the filesystem
+    root, so an unrelated SYSTEM_PROMPT.md sitting somewhere above the checkout cannot
+    silently become the prompt this service runs. Note the boundary is the repo, not
+    the package: pyproject.toml sits in middleware/, one level *below* the document.
     """
     for parent in Path(__file__).resolve().parents:
         candidate = parent / PROMPT_FILENAME
         if candidate.is_file():
             return candidate
-    return Path(PROMPT_FILENAME)
+        if (parent / ".git").exists():
+            break
+    return Path(PROMPT_FILENAME).resolve()
 
 
 class Settings(BaseSettings):

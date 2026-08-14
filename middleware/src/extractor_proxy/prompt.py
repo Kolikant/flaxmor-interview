@@ -37,12 +37,15 @@ def load_system_prompt(path: Path) -> str:
     except OSError as exc:
         raise PromptUnavailableError(f"cannot read prompt document at {path}: {exc}") from exc
 
-    _, _, after_begin = document.partition(PROMPT_BEGIN_MARKER)
-    if not after_begin:
+    # Both markers are checked the same way — on whether the separator was found, not
+    # on whether text follows it — so a document ending exactly at the begin marker
+    # reports the honest error rather than a missing-marker one.
+    _, begin, after_begin = document.partition(PROMPT_BEGIN_MARKER)
+    if not begin:
         raise PromptUnavailableError(f"{path} is missing {PROMPT_BEGIN_MARKER}")
 
-    body, separator, _ = after_begin.partition(PROMPT_END_MARKER)
-    if not separator:
+    body, end, _ = after_begin.partition(PROMPT_END_MARKER)
+    if not end:
         raise PromptUnavailableError(f"{path} is missing {PROMPT_END_MARKER}")
 
     prompt = body.strip()

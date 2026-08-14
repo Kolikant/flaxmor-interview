@@ -51,11 +51,14 @@ ok "/healthz answered — service '$service'"
 # ---------------------------------------------------------------------------
 begin "Middleware readiness — is it configured well enough to serve"
 
-ready_body=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$MIDDLEWARE_URL/readyz")
-ready_json=$(curl -sS --max-time 10 "$MIDDLEWARE_URL/readyz")
-if [ "$ready_body" != "200" ]; then
+# One request, body and status together — two calls could disagree, and step 4 below
+# already establishes this idiom.
+ready_response=$(curl -sS --max-time 10 -w '\n%{http_code}' "$MIDDLEWARE_URL/readyz")
+ready_status=$(printf '%s' "$ready_response" | tail -n1)
+ready_json=$(printf '%s' "$ready_response" | sed '$d')
+if [ "$ready_status" != "200" ]; then
   printf '%s' "$ready_json" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$ready_json"
-  die "/readyz returned $ready_body. The failing check above names the problem — usually OPENAI_API_KEY missing from .env"
+  die "/readyz returned $ready_status. The failing check above names the problem — usually OPENAI_API_KEY missing from .env"
 fi
 prompt_detail=$(printf '%s' "$ready_json" | jsonq 'print(json.load(sys.stdin)["checks"]["system_prompt"]["detail"])')
 ok "/readyz is ready"
@@ -116,6 +119,7 @@ fi
 
 envelope_report=$(printf '%s' "$body" | python3 -c '
 import json, sys
+# Mirrors the envelope contract in SYSTEM_PROMPT.md; both must move together.
 KEYS = ["document_type","confidence","language","summary",
         "fields","uncertain_fields","unextracted","warnings"]
 content = json.load(sys.stdin)["choices"][0]["message"]["content"].strip()
@@ -208,6 +212,6 @@ if [ "$webui_verified" -eq 1 ]; then
   printf 'Open %s and paste a messy document to see it in the browser.\n' "$OPEN_WEBUI_URL"
 else
   printf '%s%sMiddleware and OpenAI verified; Open WebUI was not.%s\n' "$BOLD" "$YELLOW" "$RESET"
-  printf 'Checks 1-6 passed. Start Open WebUI with: docker compose up -d\n'
+  printf 'Checks 1-%d passed. Start Open WebUI with: docker compose up -d\n' "$((step - 1))"
   exit 1
 fi

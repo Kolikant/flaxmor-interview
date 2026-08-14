@@ -1,6 +1,8 @@
 [project]
 name = "extractor-proxy"
-version = "0.1.0"
+# Read from the package rather than duplicated here: __version__ is served by /healthz
+# and in the OpenAPI document, so a drift between the two would be externally visible.
+dynamic = ["version"]
 description = "OpenAI-compatible proxy that turns any chat model into a structured data extractor"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,6 +24,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/extractor_proxy/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/extractor_proxy"]
