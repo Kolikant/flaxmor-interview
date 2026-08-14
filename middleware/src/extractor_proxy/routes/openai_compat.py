@@ -39,6 +39,60 @@ def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
     return JSONResponse(error_envelope(message, error_type), status_code=status_code)
 
 
+def _too_large(limit: int, **context: object) -> JSONResponse:
+    logger.warning("chat.rejected", extra={"reason": "body_too_large", **context})
+    return _error(
+        413, f"Request body is larger than the {limit} byte limit.", "invalid_request_error"
+    )
+
+
+async def _read_capped(request: Request, limit: int) -> bytes | None:
+    """Read the request body, stopping as soon as it passes the limit.
+
+    `request.body()` buffers the whole thing before anything can object, so the ceiling
+    would not have held for a request that declares no length — which is precisely the
+    case the declared-length check below cannot cover. Reading the stream keeps the
+    guarantee the setting actually claims.
+
+    Returns None when the limit is exceeded.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _validated_body(request: Request, limit: int) -> tuple[bytes, dict[str, Any]] | JSONResponse:
+    """Everything that has to be true before a request means anything.
+
+    Returns the raw bytes and the parsed object, or the response to send instead.
+    Separated from the route so `chat_completions` reads as what it actually does:
+    decide whether to inject, then relay.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        # Cheap pre-check: refuse an honestly-declared oversized body without reading it.
+        return _too_large(limit, content_length=int(declared))
+
+    body = await _read_capped(request, limit)
+    if body is None:
+        return _too_large(limit, body_bytes=f"over {limit}")
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error(400, "Request body is not valid JSON.", "invalid_request_error")
+
+    if not isinstance(payload, dict):
+        return _error(400, "Request body must be a JSON object.", "invalid_request_error")
+
+    return body, payload
+
+
 @router.get("/models", summary="Models advertised to Open WebUI")
 async def list_models(request: Request) -> dict[str, Any]:
     """Return the configured models without calling OpenAI.
@@ -64,36 +118,10 @@ async def chat_completions(request: Request) -> Response:
     """
     state = request.app.state
 
-    declared_length = request.headers.get("content-length")
-    limit = state.settings.max_request_bytes
-    if declared_length and declared_length.isdigit() and int(declared_length) > limit:
-        logger.warning(
-            "chat.rejected",
-            extra={"reason": "body_too_large", "content_length": int(declared_length)},
-        )
-        return _error(
-            413,
-            f"Request body is larger than the {limit} byte limit.",
-            "invalid_request_error",
-        )
-
-    body = await request.body()
-    if len(body) > limit:
-        # A chunked request declares no length, so the read is checked too.
-        logger.warning("chat.rejected", extra={"reason": "body_too_large", "body_bytes": len(body)})
-        return _error(
-            413,
-            f"Request body is larger than the {limit} byte limit.",
-            "invalid_request_error",
-        )
-
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _error(400, "Request body is not valid JSON.", "invalid_request_error")
-
-    if not isinstance(payload, dict):
-        return _error(400, "Request body must be a JSON object.", "invalid_request_error")
+    validated = await _validated_body(request, state.settings.max_request_bytes)
+    if isinstance(validated, JSONResponse):
+        return validated
+    body, payload = validated
 
     if state.system_prompt is None:
         # Relaying without the prompt would quietly turn the product into a plain
@@ -107,6 +135,7 @@ async def chat_completions(request: Request) -> Response:
 
     injected = inject_system_prompt(payload, state.system_prompt)
     streaming = bool(injected.get("stream"))
+    messages = payload.get("messages")
 
     # One line describing the request as the proxy understood it. Without this, a log
     # stream shows a POST and an upstream status but not which model was asked, whether
@@ -120,7 +149,7 @@ async def chat_completions(request: Request) -> Response:
             "request_bytes": len(body),
             # Only a list has a meaningful count, and `{"messages": 5}` is valid JSON:
             # len() on it raised, turning a log line into a 500.
-            "message_count": len(messages) if isinstance(messages := payload.get("messages"), list) else None,
+            "message_count": len(messages) if isinstance(messages, list) else None,
             "prompt_injected": injected is not payload,
         },
     )
@@ -154,12 +183,17 @@ def _log_completion_usage(result: UpstreamResponse) -> None:
     """
     if result.status_code >= 400:
         return
-    try:
-        parsed = json.loads(result.content)
-        usage = parsed.get("usage") or {}
-        finish_reason = (parsed.get("choices") or [{}])[0].get("finish_reason")
-    except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
-        return
+
+    # Shape checks rather than an exception tuple: two of the four types that arm used
+    # to catch were unreachable (a non-object body never reaches here — it is rewritten
+    # to a 502 upstream), while the one field that genuinely varies, `usage`, was read
+    # outside the guard. A body carrying `"usage": "oops"` would have raised out of a
+    # read-only logging helper and turned a good completion into a 500.
+    usage = result.payload.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    choices = result.payload.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
 
     logger.info(
         "chat.completed",

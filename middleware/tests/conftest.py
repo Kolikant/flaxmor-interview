@@ -40,3 +40,12 @@ async def sse(*chunks: bytes):
 def log_events(caplog) -> dict[str, logging.LogRecord]:
     """Captured records keyed by event name, since the message *is* the event name."""
     return {record.getMessage(): record for record in caplog.records}
+
+
+#: Verbatim opening of open-webui 0.6.5's DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE,
+#: including the "### Output:" section. Shared because both the prompt tests and the
+#: route tests need it, and a template bump has to change exactly one copy.
+TITLE_TEMPLATE = (
+    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat "
+    'history.\n### Output:\nJSON format: { "title": "your concise title here" }'
+)

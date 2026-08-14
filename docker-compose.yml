@@ -64,10 +64,12 @@ services:
     restart: unless-stopped
 
   open-webui:
-    # Pinned: OPEN_WEBUI_TASK_MARKERS in middleware/src/extractor_proxy/prompt.py is
-    # copied from this version's prompt templates. Re-check it on any bump and re-run
-    # scripts/verify.sh check 6 — if the templates change, the failure is silent and
-    # every chat title quietly becomes an extraction envelope.
+    # Pinned: TASK_HEADER_MARKER, TASK_OUTPUT_MARKER and DISTINCTIVE_TASK_OPENINGS in
+    # middleware/src/extractor_proxy/prompt.py are copied from this version's prompt
+    # templates. Re-check them on any bump and re-run scripts/verify.sh check 6 — if the
+    # templates change, the failure is silent and every chat title quietly becomes an
+    # extraction envelope. (The previous version of this comment named a constant that
+    # was later renamed, which is why prompt.py now carries the version string too.)
     image: ghcr.io/open-webui/open-webui:0.6.5
     depends_on:
       postgres:

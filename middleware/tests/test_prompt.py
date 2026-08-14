@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from conftest import TITLE_TEMPLATE
 from extractor_proxy.prompt import (
     inject_system_prompt,
     is_internal_task_request,
@@ -13,10 +14,6 @@ PROMPT = "You are a structured data extractor."
 # including the "### Output:" section each of them carries — abridged fixtures without it
 # would not exercise the two-signal rule that stops a user's "### Task:" paste from being
 # mistaken for one of these.
-TITLE_TEMPLATE = (
-    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat "
-    'history.\n### Output:\nJSON format: { "title": "your concise title here" }'
-)
 TAGS_TEMPLATE = (
     "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history"
     '\n### Output:\nJSON format: { "tags": ["tag1", "tag2", "tag3"] }'

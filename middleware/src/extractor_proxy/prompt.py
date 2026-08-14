@@ -61,7 +61,10 @@ def load_system_prompt(path: Path) -> str:
 #: signal left at this boundary.
 #:
 #: The two groups below are all eight `DEFAULT_*_PROMPT_TEMPLATE` values in
-#: open-webui v0.6.5, read out of the pinned image rather than transcribed.
+#: open-webui v0.6.5, read out of the pinned image rather than transcribed. The version
+#: string is spelled out here on purpose: grepping the repository for "0.6.5" should
+#: find this file as well as the compose pin and the README, because bumping the image
+#: without revisiting these constants breaks detection silently.
 
 #: Five templates open with this header — title, tags, query, autocomplete and image
 #: prompt. Every one of them also contains the output marker below, so both are
@@ -102,9 +105,10 @@ def is_internal_task_request(messages: list[dict[str, Any]]) -> bool:
     if not messages:
         return False
 
-    *leading, last = messages
     if not all(isinstance(message, dict) for message in messages):
         return False
+
+    *leading, last = messages
     if any(message.get("role") != "system" for message in leading):
         return False
     if last.get("role") != "user":
@@ -145,6 +149,11 @@ def inject_system_prompt(payload: dict[str, Any], system_prompt: str) -> dict[st
         # `{"messages": ["hello"]}` is valid JSON and a plausible client mistake.
         # Without this the `.get` calls below raise AttributeError and the caller gets
         # a 500 with a stack trace — the opposite of what this function promises.
+        #
+        # `is_internal_task_request` repeats this check rather than relying on this one,
+        # because it is a public predicate called directly as well as from here, and it
+        # has to be safe on its own. Two scans of a list that is normally under ten
+        # items is the price of both functions being independently correct.
         logger.warning("prompt.injection.skipped", extra={"reason": "non_object_message"})
         return payload
 

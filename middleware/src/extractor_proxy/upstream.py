@@ -25,6 +25,11 @@ SSE_DONE = b"data: [DONE]\n\n"
 SSE_DONE_MARKER = b"[DONE]"
 
 
+JSON_MEDIA_TYPE = "application/json"
+
+_MAX_ERROR_BODY_BYTES = 500
+
+
 def _sse_error(message: str) -> bytes:
     """An error object framed as one SSE event.
 
@@ -32,10 +37,6 @@ def _sse_error(message: str) -> bytes:
     this reaches the user as a message rather than a silent truncation.
     """
     return b"data: " + error_body(message, "upstream_stream_interrupted") + b"\n\n"
-
-JSON_MEDIA_TYPE = "application/json"
-
-_MAX_ERROR_BODY_BYTES = 500
 
 
 class UpstreamError(Exception):
@@ -61,10 +62,16 @@ class UpstreamError(Exception):
 
 @dataclass(frozen=True)
 class UpstreamResponse:
-    """An upstream response, ready to relay without being re-encoded."""
+    """An upstream response, ready to relay without being re-encoded.
+
+    `payload` is the same body already parsed. It is carried rather than re-derived
+    because deciding what to relay requires parsing it anyway, and every consumer that
+    wanted a dict was otherwise parsing the same bytes a second time.
+    """
 
     status_code: int
     content: bytes
+    payload: dict[str, Any]
 
 
 def _transport_failure(exc: httpx.RequestError) -> UpstreamError:
@@ -92,8 +99,8 @@ def _transport_failure(exc: httpx.RequestError) -> UpstreamError:
     return error
 
 
-def _relayable_body(response: httpx.Response) -> tuple[bytes, int]:
-    """The bytes and status to hand back to the client.
+def _relay(response: httpx.Response) -> UpstreamResponse:
+    """Decide once what the client gets: status, bytes, and the parsed body.
 
     A JSON object — success or error — is relayed verbatim with its own status, so key
     order and number formatting survive the hop untouched; a proxy that re-serialises
@@ -103,7 +110,13 @@ def _relayable_body(response: httpx.Response) -> tuple[bytes, int]:
     OpenAI can answer with an HTML page and a client expecting the OpenAI error shape
     should not have to cope with that. The status becomes 502 in that case: relaying
     the upstream status is only honest while the bytes are also the upstream's, and a
-    proxy error page arriving as `200` with an error envelope is the worst of both.
+    proxy error page arriving as its original status with a rewritten body is the worst
+    of both.
+
+    Both response modes go through here, so that decision produces one answer. It
+    previously did not: the streaming path took the bytes and discarded the status, so
+    an HTML page behind a 403 surfaced as 403 while the same body on the non-streaming
+    path surfaced as 502.
     """
     try:
         parsed = json.loads(response.content)
@@ -111,24 +124,18 @@ def _relayable_body(response: httpx.Response) -> tuple[bytes, int]:
         parsed = None
 
     if isinstance(parsed, dict):
-        return response.content, response.status_code
+        return UpstreamResponse(response.status_code, response.content, parsed)
 
     # Slice before decoding: `response.text` would decode and cache the whole body to
     # keep a fragment of it, which is the one place a hostile upstream makes this
     # proxy allocate in proportion to its response.
     excerpt = response.content[:_MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace")
-    body = error_body(
+    envelope = error_envelope(
         f"Upstream returned a body that is not a JSON object: {excerpt}",
         "upstream_error",
         code=str(response.status_code),
     )
-    return body, 502
-
-
-def _error_payload(response: httpx.Response) -> dict[str, Any]:
-    """An upstream error as a dict, for the streaming path's raise-before-first-byte."""
-    body, _ = _relayable_body(response)
-    return json.loads(body)
+    return UpstreamResponse(502, json.dumps(envelope).encode(), envelope)
 
 
 class UpstreamClient:
@@ -176,9 +183,9 @@ class UpstreamClient:
         except httpx.RequestError as exc:
             raise _transport_failure(exc) from exc
 
-        content, status_code = _relayable_body(response)
-        logger.info("upstream.response", extra={"status": status_code, "streamed": False})
-        return UpstreamResponse(status_code=status_code, content=content)
+        relayed = _relay(response)
+        logger.info("upstream.response", extra={"status": relayed.status_code, "streamed": False})
+        return relayed
 
     async def stream_chat_completion(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
         """Relay an SSE stream from OpenAI, chunk for chunk.
@@ -206,11 +213,13 @@ class UpstreamClient:
             ) as response:
                 if response.status_code >= 400:
                     await response.aread()
+                    # Same relay decision as the non-streaming path, status included.
+                    relayed = _relay(response)
                     logger.warning(
                         "upstream.response",
-                        extra={"status": response.status_code, "streamed": True},
+                        extra={"status": relayed.status_code, "streamed": True},
                     )
-                    raise UpstreamError(response.status_code, _error_payload(response))
+                    raise UpstreamError(relayed.status_code, relayed.payload)
 
                 logger.info(
                     "upstream.response",
@@ -252,6 +261,6 @@ class UpstreamClient:
             return
 
         if not saw_done:
-            logger.warning("upstream.stream.unterminated", extra={"sent_any": sent_any})
+            logger.warning("upstream.stream.unterminated")
             yield _sse_error("The upstream response ended without a terminator.")
             yield SSE_DONE

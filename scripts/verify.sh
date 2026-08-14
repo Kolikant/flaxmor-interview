@@ -25,7 +25,7 @@ set -uo pipefail
 env_port() {
     if [ -n "${2-}" ]; then printf '%s' "$2"; return; fi
     if [ -f .env ]; then
-        value=$(grep -E "^$1=" .env | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')
+        value=$(grep -E "^$1=" .env | tail -1 | cut -d= -f2- | tr -d "\"' ")
         if [ -n "$value" ]; then printf '%s' "$value"; return; fi
     fi
     printf '%s' "$3"
@@ -34,6 +34,8 @@ env_port() {
 MIDDLEWARE_PORT=$(env_port MIDDLEWARE_PORT "${MIDDLEWARE_PORT-}" 8000)
 OPEN_WEBUI_PORT=$(env_port OPEN_WEBUI_PORT "${OPEN_WEBUI_PORT-}" 3000)
 
+# Recorded before defaulting, so check 7 can tell a local stack from a remote target.
+[ -n "${MIDDLEWARE_URL:-}${OPEN_WEBUI_URL:-}" ] && MIDDLEWARE_URL_OVERRIDDEN=1
 MIDDLEWARE_URL="${MIDDLEWARE_URL:-http://localhost:$MIDDLEWARE_PORT}"
 OPEN_WEBUI_URL="${OPEN_WEBUI_URL:-http://localhost:$OPEN_WEBUI_PORT}"
 VERIFY_MODEL="${VERIFY_MODEL:-gpt-4o-mini}"
@@ -231,7 +233,12 @@ begin "Credential containment — the real key stays in the middleware"
 # placeholder. That is a comment in docker-compose.yml until something checks it: if the
 # env file were ever shared, the real key would become what Open WebUI presents to this
 # proxy and would be readable in its admin UI in the browser.
-if ! docker compose ps --status running --services 2>/dev/null | grep -q '^open-webui$'; then
+# Every other check is black-box over HTTP and works against any target the URL
+# variables point at. This one inspects local Docker state, so it only means anything
+# when the target actually is the local compose stack.
+if [ -n "${MIDDLEWARE_URL_OVERRIDDEN:-}" ]; then
+  warn "skipping: this check only applies to the local compose stack"
+elif ! docker compose ps --status running --services 2>/dev/null | grep -q '^open-webui$'; then
   warn "open-webui is not running; skipping the containment check"
 else
   webui_key=$(docker compose exec -T open-webui printenv OPENAI_API_KEY 2>/dev/null | tr -d '\r')

@@ -7,7 +7,7 @@ import httpx2 as httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import DUMMY_API_KEY, log_events, sse
+from conftest import DUMMY_API_KEY, TITLE_TEMPLATE, log_events, sse
 from extractor_proxy.config import Settings
 from extractor_proxy.main import create_app
 from extractor_proxy.upstream import UpstreamClient
@@ -18,12 +18,7 @@ COMPLETION = {
     "choices": [{"index": 0, "message": {"role": "assistant", "content": '{"a": 1}'}}],
 }
 
-# Faithful to the real 0.6.5 template, "### Output:" section included — the proxy
-# requires both signals before treating a message as Open WebUI bookkeeping.
-TITLE_TEMPLATE = (
-    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat "
-    'history.\n### Output:\nJSON format: { "title": "your concise title here" }'
-)
+
 
 
 def build_app(handler, **overrides):
@@ -511,3 +506,38 @@ def test_an_unhandled_error_still_carries_the_request_id():
     assert response.status_code == 500
     assert response.headers["x-request-id"] == "trace-me"
     assert response.json()["error"]["request_id"] == "trace-me"
+
+
+def test_an_undeclared_oversized_body_is_refused_without_buffering_it_all():
+    # A chunked request declares no content-length, so the pre-check cannot see it.
+    # request.body() would buffer the whole thing before anything could object, which
+    # is exactly the case MAX_REQUEST_BYTES claims to prevent.
+    handler, seen = recording_handler()
+    app = build_app(handler, max_request_bytes=1000)
+
+    def oversized_chunks():
+        for _ in range(20):
+            yield b"x" * 200
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=oversized_chunks(),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert seen == []
+
+
+def test_a_completion_with_a_malformed_usage_field_still_succeeds():
+    # `usage` was read outside the guard, so a body carrying "usage": "oops" raised out
+    # of a read-only logging helper and turned a good completion into a 500.
+    odd = {"choices": [{"index": 0, "finish_reason": "stop"}], "usage": "oops"}
+    app = build_app(lambda r: httpx.Response(200, json=odd))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=user_turn())
+
+    assert response.status_code == 200
+    assert response.json() == odd

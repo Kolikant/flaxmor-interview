@@ -251,7 +251,7 @@ async def test_an_empty_success_body_raises_before_any_byte_is_sent():
 
 
 async def test_a_streaming_error_body_that_is_not_openai_shaped_still_raises_cleanly():
-    # _relayable_body relays any JSON object verbatim, so a gateway answering
+    # _relay hands back any JSON object verbatim, so a gateway answering
     # {"detail": ...} used to raise KeyError inside the generator — which is not an
     # UpstreamError, so the route could not catch it and the client got a bare 500.
     client = build_client(lambda request: httpx.Response(502, json={"detail": "bad gateway"}))
@@ -299,3 +299,27 @@ async def test_a_cancelled_consumer_is_logged_like_an_abandoned_stream(caplog):
         await stream.athrow(asyncio.CancelledError())
 
     assert log_events(caplog)["upstream.stream.abandoned"].reason == "consumer_disconnected"
+
+
+async def test_a_non_object_body_gets_the_same_status_in_both_modes():
+    # The relay decision used to live in two places: the streaming path took the
+    # rewritten bytes and kept the upstream status, so a captive-portal HTML page
+    # behind a 403 surfaced as 403 streaming and 502 non-streaming.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="<html>blocked</html>")
+
+    non_streaming = await build_client(handler).chat_completion(PAYLOAD)
+
+    with pytest.raises(UpstreamError) as streaming:
+        await anext(build_client(handler).stream_chat_completion(PAYLOAD))
+
+    assert non_streaming.status_code == streaming.value.status_code == 502
+
+
+async def test_the_parsed_body_is_carried_rather_than_re_derived():
+    client = build_client(lambda request: httpx.Response(200, json=COMPLETION))
+
+    response = await client.chat_completion(PAYLOAD)
+
+    assert response.payload == COMPLETION
+    assert json.loads(response.content) == response.payload

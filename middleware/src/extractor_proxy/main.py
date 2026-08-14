@@ -103,11 +103,12 @@ def _install_error_handlers(app: FastAPI) -> None:
         # hand — an unhandled 500 is precisely when a correlation id is most wanted, so
         # it must not be the one response that lacks it.
         request_id = (request.scope.get("state") or {}).get("request_id")
-        envelope = error_envelope("The proxy failed to handle this request.", "internal_error")
-        if request_id:
-            envelope["error"]["request_id"] = request_id
         return JSONResponse(
-            envelope,
+            error_envelope(
+                "The proxy failed to handle this request.",
+                "internal_error",
+                request_id=request_id,
+            ),
             status_code=500,
             headers={REQUEST_ID_HEADER: request_id} if request_id else None,
         )

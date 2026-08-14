@@ -271,7 +271,7 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-131 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
+135 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
 streams that fail mid-flight, end without a terminator, and are abandoned by a cancelled
 consumer.
 
