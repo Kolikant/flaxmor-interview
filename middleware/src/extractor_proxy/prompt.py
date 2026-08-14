@@ -54,18 +54,28 @@ def load_system_prompt(path: Path) -> str:
 
     return prompt
 
-#: Openings of the prompt templates Open WebUI sends for its own bookkeeping calls
-#: (chat title, tag, search-query and emoji generation). Taken from
-#: `DEFAULT_*_PROMPT_TEMPLATE` in open-webui v0.6.5's config.py.
-#:
 #: Matching on template text is not the detection I would have picked. Open WebUI
 #: labels these calls in the request body as `metadata.task`, but its OpenAI router
 #: does `metadata = payload.pop("metadata", None)` before forwarding, so that label
 #: never survives to a proxy sitting where this one sits. The prompt text is the only
 #: signal left at this boundary.
-OPEN_WEBUI_TASK_MARKERS: tuple[str, ...] = (
-    "### Task:",
+#:
+#: The two groups below are all eight `DEFAULT_*_PROMPT_TEMPLATE` values in
+#: open-webui v0.6.5, read out of the pinned image rather than transcribed.
+
+#: Five templates open with this header — title, tags, query, autocomplete and image
+#: prompt. Every one of them also contains the output marker below, so both are
+#: required: a person pasting a to-do list that happens to start "### Task:" would
+#: otherwise silently get no extraction at all.
+TASK_HEADER_MARKER = "### Task:"
+TASK_OUTPUT_MARKER = "### Output:"
+
+#: The remaining three templates have no common header, so each is matched on an
+#: opening distinctive enough to stand alone.
+DISTINCTIVE_TASK_OPENINGS: tuple[str, ...] = (
     "Your task is to reflect the speaker's likely facial expression",
+    "You have been provided with a set of responses from various models",
+    "Available Tools:",
 )
 
 
@@ -77,25 +87,39 @@ def is_internal_task_request(messages: list[dict[str, Any]]) -> bool:
     (`{"title": ...}`, `{"tags": [...]}`), so forcing the extraction contract onto
     them turns every chat title into an extraction envelope.
 
-    The test is deliberately narrow — a single user message whose content *starts*
-    with a known template opening — so that a person pasting a document that happens
-    to contain "### Task:" further down is still treated as a real turn.
+    The shape matched is a final user message carrying a template, optionally preceded
+    only by system messages. The system-message allowance is not hypothetical: giving
+    an Open WebUI workspace model a system prompt makes
+    `apply_model_system_prompt_to_body` prepend it to *every* request including these,
+    so requiring exactly one message would silently stop recognising task calls the
+    moment a user configures a model — and every chat title would become an envelope.
+
+    Matching stays narrow in the other direction too. The `### Task:` header alone is
+    not enough, because a person pasting a to-do list that opens with it would get no
+    extraction at all; the templates that use that header also carry an output marker,
+    so both are required.
     """
-    if len(messages) != 1:
+    if not messages:
         return False
 
-    (message,) = messages
-    if message.get("role") != "user":
+    *leading, last = messages
+    if not all(isinstance(message, dict) for message in messages):
+        return False
+    if any(message.get("role") != "system" for message in leading):
+        return False
+    if last.get("role") != "user":
         return False
 
-    content = message.get("content")
+    content = last.get("content")
     if not isinstance(content, str):
         # Multimodal content arrives as a list of parts. Open WebUI never sends its
         # task templates that way, so anything non-string is a real user turn.
         return False
 
     stripped = content.lstrip()
-    return any(stripped.startswith(marker) for marker in OPEN_WEBUI_TASK_MARKERS)
+    if stripped.startswith(TASK_HEADER_MARKER):
+        return TASK_OUTPUT_MARKER in content
+    return any(stripped.startswith(opening) for opening in DISTINCTIVE_TASK_OPENINGS)
 
 
 def inject_system_prompt(payload: dict[str, Any], system_prompt: str) -> dict[str, Any]:
@@ -115,6 +139,13 @@ def inject_system_prompt(payload: dict[str, Any], system_prompt: str) -> dict[st
         # Not this proxy's job to invent validation errors — pass it through and let
         # OpenAI answer with its own, which is what an OpenAI-compatible client expects.
         logger.warning("prompt.injection.skipped", extra={"reason": "no_messages"})
+        return payload
+
+    if not all(isinstance(message, dict) for message in messages):
+        # `{"messages": ["hello"]}` is valid JSON and a plausible client mistake.
+        # Without this the `.get` calls below raise AttributeError and the caller gets
+        # a 500 with a stack trace — the opposite of what this function promises.
+        logger.warning("prompt.injection.skipped", extra={"reason": "non_object_message"})
         return payload
 
     if is_internal_task_request(messages):

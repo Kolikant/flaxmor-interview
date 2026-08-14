@@ -9,18 +9,32 @@ from extractor_proxy.prompt import (
 
 PROMPT = "You are a structured data extractor."
 
-# Verbatim openings of the templates open-webui v0.6.5 sends for its own bookkeeping.
+# Verbatim openings of the templates open-webui v0.6.5 sends for its own bookkeeping,
+# including the "### Output:" section each of them carries — abridged fixtures without it
+# would not exercise the two-signal rule that stops a user's "### Task:" paste from being
+# mistaken for one of these.
 TITLE_TEMPLATE = (
-    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history."
+    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat "
+    'history.\n### Output:\nJSON format: { "title": "your concise title here" }'
 )
 TAGS_TEMPLATE = (
     "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history"
+    '\n### Output:\nJSON format: { "tags": ["tag1", "tag2", "tag3"] }'
 )
 QUERY_TEMPLATE = (
-    "### Task:\nAnalyze the chat history to determine the necessity of generating search queries"
+    "### Task:\nAnalyze the chat history to determine the necessity of generating search "
+    'queries\n### Output:\nStrictly return in JSON format: \n{\n  "queries": ["query1"]\n}'
 )
 EMOJI_TEMPLATE = (
     "Your task is to reflect the speaker's likely facial expression through a fitting emoji."
+)
+MOA_TEMPLATE = (
+    "You have been provided with a set of responses from various models to the latest user "
+    'query: "what is the total?"\n\nYour task is to synthesize these responses.'
+)
+TOOLS_TEMPLATE = (
+    "Available Tools: [{'name': 'get_weather'}]\n\nYour task is to choose and return the "
+    "correct tool(s) from the list of available tools based on the query."
 )
 
 
@@ -91,8 +105,8 @@ def test_injection_is_idempotent():
 
 @pytest.mark.parametrize(
     "template",
-    [TITLE_TEMPLATE, TAGS_TEMPLATE, QUERY_TEMPLATE, EMOJI_TEMPLATE],
-    ids=["title", "tags", "query", "emoji"],
+    [TITLE_TEMPLATE, TAGS_TEMPLATE, QUERY_TEMPLATE, EMOJI_TEMPLATE, MOA_TEMPLATE, TOOLS_TEMPLATE],
+    ids=["title", "tags", "query", "emoji", "moa", "tools"],
 )
 def test_open_webui_internal_tasks_are_left_alone(template):
     # These calls expect their own small JSON object back. Injecting the extraction
@@ -144,3 +158,53 @@ def test_malformed_message_lists_pass_straight_through(payload):
     # Validating this here would mean inventing error responses OpenAI itself would
     # phrase differently; the upstream is left to reject it.
     assert inject_system_prompt(payload, PROMPT) is payload
+
+
+# --- shapes found by the code-review pass -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [["hello"], [None], [{"role": "user", "content": "a receipt"}, "trailing"]],
+    ids=["bare-string", "null", "mixed"],
+)
+def test_a_messages_list_holding_non_objects_passes_straight_through(messages):
+    # Valid JSON and a plausible client mistake. Before this guard the `.get` calls
+    # raised AttributeError and the caller received a 500 with a stack trace — the
+    # opposite of what this function documents.
+    payload = {"model": "gpt-4o-mini", "messages": messages}
+
+    assert inject_system_prompt(payload, PROMPT) is payload
+    assert is_internal_task_request(messages) is False
+
+
+def test_a_task_request_is_still_recognised_behind_a_model_system_prompt():
+    # Giving an Open WebUI workspace model a system prompt makes it prepend that to
+    # every request, task calls included. Requiring exactly one message meant detection
+    # silently stopped working the moment a user configured a model.
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": TITLE_TEMPLATE},
+    ]
+
+    assert is_internal_task_request(messages) is True
+    assert inject_system_prompt({"messages": messages}, PROMPT)["messages"] == messages
+
+
+def test_a_user_paste_opening_with_the_task_header_is_still_extracted():
+    # The header alone is not enough: a to-do list starting "### Task:" would otherwise
+    # get no extraction at all. The real templates also carry an output marker.
+    payload = {"messages": [{"role": "user", "content": "### Task: buy milk\nAlso bread"}]}
+
+    result = inject_system_prompt(payload, PROMPT)
+
+    assert result["messages"][0]["content"] == PROMPT
+
+
+def test_a_conversation_ending_in_an_assistant_turn_is_not_a_task_request():
+    messages = [
+        {"role": "user", "content": TITLE_TEMPLATE},
+        {"role": "assistant", "content": '{"title": "Invoice"}'},
+    ]
+
+    assert is_internal_task_request(messages) is False
