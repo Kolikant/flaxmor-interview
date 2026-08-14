@@ -126,6 +126,10 @@ class UpstreamClient:
         return {
             "authorization": f"Bearer {self._settings.openai_api_key}",
             "content-type": "application/json",
+            # Ask for an unencoded body. httpx decodes transparently but leaves the
+            # original content-encoding on the response, so an encoded upstream reply
+            # invites a header that no longer describes the bytes being relayed.
+            "accept-encoding": "identity",
         }
 
     async def chat_completion(self, payload: dict[str, Any]) -> UpstreamResponse:
