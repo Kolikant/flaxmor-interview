@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -61,6 +63,11 @@ class Settings(BaseSettings):
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 90.0
 
+    # Ceiling on a request body, checked before it is read. Generous, because a pasted
+    # document is legitimately large — the point is that "large" has a limit at all, so
+    # one caller cannot make the process buffer an arbitrary amount of memory.
+    max_request_bytes: int = 8 * 1024 * 1024
+
     log_level: str = "INFO"
     service_name: str = "extractor-proxy"
     system_prompt_path: Path = Field(default_factory=discover_system_prompt_path)
@@ -75,10 +82,48 @@ class Settings(BaseSettings):
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
+    @field_validator("openai_base_url")
+    @classmethod
+    def _reject_credentials_in_url(cls, value: str) -> str:
+        """Refuse a base URL carrying userinfo.
+
+        httpx logs request URLs without masking userinfo, so `https://user:pass@host`
+        would put a credential into the log stream of a service that is otherwise
+        careful never to log one. Failing at startup is better than leaking quietly.
+        """
+        if "@" in urlsplit(value).netloc:
+            raise ValueError(
+                "OPENAI_BASE_URL must not embed credentials; pass the key via OPENAI_API_KEY"
+            )
+        return value
+
     @field_validator("log_level")
     @classmethod
     def _normalise_log_level(cls, value: str) -> str:
         return value.upper()
+
+    def redacted_summary(self) -> dict[str, Any]:
+        """Every effective setting, safe to log, with the key reduced to a fingerprint.
+
+        Logged once at startup because "which configuration is this container actually
+        running?" is the first question of most debugging sessions, and the answer
+        otherwise lives across a .env file, compose defaults and the process
+        environment. The key is reported as present-or-not plus a length, which is
+        enough to tell "unset" from "set to the wrong thing" without printing it.
+        """
+        return {
+            "openai_base_url": self.openai_base_url,
+            "openai_api_key_present": bool(self.openai_api_key),
+            "openai_api_key_length": len(self.openai_api_key),
+            "exposed_models": self.exposed_model_ids,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "read_timeout_seconds": self.read_timeout_seconds,
+            "max_request_bytes": self.max_request_bytes,
+            "system_prompt_path": str(self.system_prompt_path),
+            "log_level": self.log_level,
+            "host": self.host,
+            "port": self.port,
+        }
 
     @property
     def exposed_model_ids(self) -> list[str]:

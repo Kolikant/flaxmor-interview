@@ -14,6 +14,7 @@ from conftest import log_events as events
 from extractor_proxy.observability import (
     JsonFormatter,
     RequestLifecycleMiddleware,
+    redact_secrets,
     request_id_var,
 )
 
@@ -262,3 +263,54 @@ async def test_a_non_http_scope_is_passed_through_untouched(caplog):
 
     assert seen["scope"] is scope
     assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # A short prefix survives so two log lines about the same key still correlate;
+        # four characters of a 164-character key is not a meaningful disclosure.
+        ("sk-proj-AbCdEfGhIjKlMnOpQrSt", "sk-proj...redacted"),
+        ("Bearer sk-1234567890abcdef", "Bearer sk-1234...redacted"),
+        ("nothing secret here", "nothing secret here"),
+    ],
+    ids=["project-key", "bearer", "innocuous"],
+)
+def test_key_shaped_values_are_masked(raw, expected):
+    assert redact_secrets(raw) == expected
+
+
+def test_a_credential_reaching_a_log_line_is_masked_in_the_output(json_logger):
+    # Containment is a property of the output, not a convention each call site has to
+    # remember: the formatter merges arbitrary `extra` fields and stringifies anything.
+    logger, lines = json_logger
+
+    logger.info("upstream.call", extra={"url": "https://x@api/v1?k=sk-proj-AbCdEfGhIjKlMnOp"})
+
+    (entry,) = lines()
+    assert "sk-proj-AbCdEfGhIjKlMnOp" not in json.dumps(entry)
+    assert "redacted" in entry["url"]
+
+
+@pytest.mark.parametrize(
+    ("inbound", "expected"),
+    [
+        ("trace-from-caller", "trace-from-caller"),
+        ("bad\r\nX-Injected: yes", "badX-Injected:yes".replace(":", "")),
+        ("x" * 200, "x" * 64),
+        ("!!!", None),
+    ],
+    ids=["clean", "crlf-stripped", "truncated", "nothing-usable"],
+)
+def test_an_inbound_request_id_is_sanitised(inbound, expected):
+    # Caller-controlled, and it lands in both a response header and every log record
+    # for the request, so it is filtered rather than trusted.
+    with TestClient(probe_app()) as client:
+        response = client.get("/ok", headers={"X-Request-ID": inbound})
+
+    returned = response.headers["x-request-id"]
+    if expected is None:
+        # Nothing usable survived, so a fresh id was generated instead.
+        assert returned and returned != inbound
+    else:
+        assert returned == expected

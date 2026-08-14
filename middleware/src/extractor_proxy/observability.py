@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -30,6 +31,20 @@ request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 _STANDARD_RECORD_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__
 ) | {"asctime", "message"}
+
+
+#: Anything shaped like an API key is masked on its way out, wherever it came from.
+#: No call site passes a credential today, but the formatter merges arbitrary `extra`
+#: fields and stringifies anything, so this makes containment a property of the output
+#: rather than a convention every future call site has to remember. It also covers
+#: libraries logging through the same root handler — httpx logs request URLs, which
+#: would carry credentials if a base URL ever embedded them.
+_SECRET_PATTERN = re.compile(r"(sk-[A-Za-z0-9_\-]{4})[A-Za-z0-9_\-]{8,}")
+
+
+def redact_secrets(text: str) -> str:
+    """Mask anything key-shaped, keeping a short prefix so lines stay correlatable."""
+    return _SECRET_PATTERN.sub(r"\1...redacted", text)
 
 
 class JsonFormatter(logging.Formatter):
@@ -70,7 +85,7 @@ class JsonFormatter(logging.Formatter):
                 "stack": self.formatException(record.exc_info),
             }
 
-        return json.dumps(payload, default=str, ensure_ascii=False)
+        return redact_secrets(json.dumps(payload, default=str, ensure_ascii=False))
 
 
 def configure_logging(level: str = "INFO", service_name: str = "extractor-proxy") -> None:
@@ -97,10 +112,27 @@ def configure_logging(level: str = "INFO", service_name: str = "extractor-proxy"
         uvicorn_logger.handlers = []
         uvicorn_logger.propagate = True
 
+    # httpx logs one INFO line per request ("HTTP Request: POST ... 200 OK") that says
+    # strictly less than the upstream.response event beside it, and carries no request
+    # id. Warnings and above still come through.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+#: An inbound trace id is caller-controlled and gets both echoed into a response
+#: header and written to every log line for the request, so it is filtered to
+#: characters that are safe in both and truncated. Nothing legitimate needs more.
+_REQUEST_ID_ALLOWED = re.compile(r"[^A-Za-z0-9._\-]")
+_REQUEST_ID_MAX_LENGTH = 64
+
 
 def _inbound_request_id(scope: Scope) -> str | None:
-    """Reuse a caller's trace id so it survives the hop into this service."""
-    return (Headers(scope=scope).get(REQUEST_ID_HEADER) or "").strip() or None
+    """Reuse a caller's trace id so it survives the hop into this service.
+
+    Sanitised rather than trusted: an arbitrary header value would otherwise reach a
+    response header and every log record for the request.
+    """
+    raw = (Headers(scope=scope).get(REQUEST_ID_HEADER) or "").strip()
+    return _REQUEST_ID_ALLOWED.sub("", raw)[:_REQUEST_ID_MAX_LENGTH] or None
 
 
 class RequestLifecycleMiddleware:

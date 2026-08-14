@@ -225,6 +225,29 @@ ok "a title request returned a title, not an envelope"
 info "title: $(printf '%s' "$title" | head -c 60)"
 
 # ---------------------------------------------------------------------------
+begin "Credential containment — the real key stays in the middleware"
+
+# compose scopes env_file to the middleware service and hands Open WebUI a literal
+# placeholder. That is a comment in docker-compose.yml until something checks it: if the
+# env file were ever shared, the real key would become what Open WebUI presents to this
+# proxy and would be readable in its admin UI in the browser.
+if ! docker compose ps --status running --services 2>/dev/null | grep -q '^open-webui$'; then
+  warn "open-webui is not running; skipping the containment check"
+else
+  webui_key=$(docker compose exec -T open-webui printenv OPENAI_API_KEY 2>/dev/null | tr -d '\r')
+  case "$webui_key" in
+    sk-*) die "the real OpenAI key is present in the Open WebUI container; env_file must be scoped to the middleware service" ;;
+    "")   warn "Open WebUI has no OPENAI_API_KEY set; it will not reach the middleware" ;;
+    *)    ok "Open WebUI holds a placeholder, not the real key" ;;
+  esac
+  if docker compose port middleware 8000 2>/dev/null | grep -qv '^127\.0\.0\.1:'; then
+    warn "the middleware port is published beyond loopback; it holds the key and has no inbound auth"
+  else
+    ok "the middleware port is bound to loopback"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 begin "Open WebUI — reachable, and its database hop works"
 
 webui_verified=0
