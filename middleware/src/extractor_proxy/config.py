@@ -43,9 +43,12 @@ class Settings(BaseSettings):
     # Models advertised to Open WebUI on GET /v1/models, as a comma-separated list.
     exposed_models: str = "gpt-4o-mini"
 
-    # Total budget for an upstream call, and the slice of it allowed for connecting.
-    request_timeout_seconds: float = 90.0
+    # httpx applies timeouts per operation rather than per request, so there is
+    # deliberately no overall deadline: a single total budget would abort a stream that
+    # is still legitimately producing tokens. Connect stays short to fail fast on a
+    # dead upstream; read bounds the gap *between* streamed chunks.
     connect_timeout_seconds: float = 10.0
+    read_timeout_seconds: float = 90.0
 
     log_level: str = "INFO"
     service_name: str = "extractor-proxy"
