@@ -1,60 +1,112 @@
-# Structured-extraction middleware for Open WebUI
+# Turn messy text into structured data, in a chat window
 
-A local stack of three services. Open WebUI talks to a FastAPI proxy instead of talking
-to OpenAI directly; the proxy injects a system prompt that turns the model into a
-structured data extractor, then streams the answer back.
+Paste a crumpled receipt, a forwarded email, a job ad, a clinical note — anything — into
+a chat box, and get back one JSON object: what kind of document it was, every field it
+contains, and an honest list of the bits the model wasn't sure about.
 
-```
-Browser ──▶ Open WebUI 0.6.5 ──▶ middleware (FastAPI) ──▶ OpenAI
-                   │                    │
-                   └──▶ Postgres        └── injects the prompt in SYSTEM_PROMPT.md
-```
-
-Paste an email, a receipt, a job listing, or a medical note into the chat and the reply
-is a single JSON block: what kind of document it is, every field extracted under fixed
-conventions, and an explicit list of the values the model is unsure about. Ask a
-follow-up question instead and it answers in prose, citing the fields it drew on.
-
-- The prompt and the reasoning behind it: [SYSTEM_PROMPT.md](SYSTEM_PROMPT.md)
-- What it actually did when run against `gpt-4o-mini`, including what failed:
-  [the live-runs section](SYSTEM_PROMPT.md#what-the-live-runs-actually-showed)
+Three services, one command to start them, and a script that tells you whether it works.
 
 ---
 
-## Running it
+## What it looks like
 
-Requires Docker with Compose, and an OpenAI API key with credit on it.
+You paste this:
+
+```
+FROM: Acme Ltd. inv #A-4491  4/3/25
+widget x2 ....... 60.00
+courier ......... 22.1O
+TOTAL 82.10 due on receipt
+```
+
+You get this back — real output, not an illustration:
+
+```json
+{
+  "document_type": "invoice",
+  "confidence": 0.91,
+  "language": "en",
+  "summary": "Invoice A-4491 from Acme Ltd for two line items totalling 82.10, due on receipt.",
+  "fields": {
+    "parties": [{ "name": "Acme Ltd.", "role": "supplier" }],
+    "identifiers": { "invoice_number": "A-4491" },
+    "dates": { "issued": "4/3/25", "due": null },
+    "line_items": [
+      { "description": "widget",  "quantity": 2, "amount": { "amount": 60.0, "currency": null } },
+      { "description": "courier", "quantity": 1, "amount": { "amount": 22.1, "currency": null } }
+    ],
+    "totals": { "total": { "amount": 82.1, "currency": null } },
+    "payment_terms": "due on receipt"
+  },
+  "uncertain_fields": [
+    { "path": "fields.dates.issued", "confidence": 0.45,
+      "reason": "4/3/25 is ambiguous between D/M/Y and M/D/Y" },
+    { "path": "fields.line_items[1].amount.amount", "confidence": 0.7,
+      "reason": "source reads 22.1O with a letter O; inferred 22.10 from the stated total" },
+    { "path": "fields.totals.total.currency", "confidence": 0.3,
+      "reason": "no currency symbol or code anywhere in the document" }
+  ],
+  "unextracted": [],
+  "warnings": []
+}
+```
+
+Look at `uncertain_fields`. It caught the letter `O` pretending to be a zero, noticed
+`4/3/25` could be March or April, and refused to guess a currency that isn't there. That
+list is the point of the whole exercise: an extractor that never admits doubt is worse
+than one that extracts less.
+
+Ask a follow-up instead of pasting, and it drops the JSON and answers in prose — again,
+really:
+
+> **you:** what was the total, and what weren't you sure about?
+>
+> **it:** The total was GBP 82.10, from `fields.totals.total`. I had uncertainties
+> regarding the invoice issue date (`fields.dates.issued`), the amount for the courier
+> line item (`fields.line_items[1].amount.amount`), and the currency of the total amount
+> (`fields.totals.total.currency`).
+
+It cites the fields it drew on, which is what it's asked to do. It also says "GBP" —
+which appears nowhere in the document, and which the extraction itself recorded as `null`
+with 0.30 confidence. The prose contradicts the JSON beside it. That's a real flaw, it's
+in [known limitations](#known-limitations), and the only reason you can catch it is that
+`uncertain_fields` wrote the doubt down.
+
+---
+
+## Run it
+
+You need Docker, and an OpenAI API key with credit on it.
 
 ```bash
-cp .env.example .env
-# edit .env and set OPENAI_API_KEY
+cp .env.example .env      # then put your key in OPENAI_API_KEY
 docker compose up -d
 ./scripts/verify.sh
 ```
 
-`verify.sh` is the fastest way to know it works — it checks each hop in order and tells
-you which one broke. On success, open <http://localhost:3000>, create the first account
-(it becomes the admin), pick `gpt-4o-mini` in the model selector, and paste something
-messy.
+Then open <http://localhost:3000>, create an account (the first one becomes admin), pick
+`gpt-4o-mini`, and paste something messy.
 
-`.env` is the only file you need to touch. It is gitignored; `.env.example` documents
-every variable and holds only placeholders.
+`verify.sh` is how you know it works. It walks the chain one hop at a time and stops at
+the first thing that's broken, so you get "Open WebUI cannot reach Postgres" rather than
+a blank screen:
 
-### What verify.sh proves
+```
+[4] Extraction — a messy document becomes the envelope
+  ✓ all eight envelope keys present, in order
+     fenced=True type=invoice confidence=0.91
+     uncertain_fields=3 warnings=1
+```
 
-| Check | What it rules out |
+Its exit code tells you *which kind* of broken, because these two look identical in a
+browser and mixing them up wastes an afternoon:
+
+| Exit | Meaning |
 | --- | --- |
-| 1. `/healthz` | The middleware process is not running |
-| 2. `/readyz` | Missing API key, or `SYSTEM_PROMPT.md` not readable in the container |
-| 3. `/v1/models` | An empty model selector in Open WebUI |
-| 4. Extraction | The prompt is not reaching the model, or the envelope contract broke |
-| 5. Streaming | Responses are buffered, or the stream never terminates |
-| 6. Injection scoping | Open WebUI's own title/tag calls are being corrupted |
-| 7. Open WebUI `/health/db` | Open WebUI cannot reach Postgres |
-
-Its exit codes are distinct, because two failures look identical in a browser and
-confusing them wastes the most time: `1` a hop is broken, `2` the stack is not running,
-`3` **the chain works but OpenAI refused you** — out of quota, unpaid, or a bad key.
+| `0` | everything works |
+| `1` | a hop is broken — something is misconfigured |
+| `2` | the stack isn't running |
+| `3` | **the chain is fine, OpenAI refused you** — no credit, or a bad key |
 
 ### Running the tests
 
@@ -64,243 +116,210 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-115 tests, no network access — the OpenAI upstream is faked with `httpx2.MockTransport`,
-including the streams that fail halfway through, end without a terminator, or are
-abandoned by a cancelled consumer.
+129 tests, none of which touch the network. The OpenAI end is faked, including the awkward
+cases: streams that die halfway, streams that stop without saying they're finished, and
+consumers that hang up mid-answer.
 
-### Useful commands
+---
 
-```bash
-docker compose logs -f middleware          # structured JSON, one event per line
-docker compose ps                          # health of all three services
-docker compose exec postgres psql -U openwebui -d openwebui
-docker compose down                        # stop, keep data
-docker compose down -v                     # stop and wipe Postgres + Open WebUI state
+## How it works
+
+```
+you ──▶ Open WebUI ──▶ middleware ──▶ OpenAI
+             │              │
+             ▼              └─ adds the prompt from SYSTEM_PROMPT.md
+          Postgres
 ```
 
----
+Open WebUI thinks it's talking to OpenAI. It isn't — it's talking to the middleware,
+which is OpenAI-shaped enough to fool it. On the way through, the middleware slips a
+system prompt into the conversation that turns the model into an extractor. The answer
+streams straight back, byte for byte.
 
-## Design decisions
+That's the whole trick. Open WebUI is unmodified, and the model is unmodified. The
+behaviour lives entirely in one prompt and one proxy.
 
-### The output contract splits a fixed envelope from a document-shaped body
+**A request, end to end:**
 
-The brief asks for a *consistent* JSON block and extraction of *all* key data from *any*
-text. Those pull against each other: a schema strict enough to cover both a medical
-report and a shipping label would either be enormous or throw most of each document
-away.
+1. Open WebUI posts a chat completion to `/v1/chat/completions`.
+2. The middleware checks the body, then decides whether this is a real person typing or
+   Open WebUI talking to itself (more on that below).
+3. If it's a person, the extraction prompt goes in front of their message.
+4. The request goes to OpenAI with the *server's* key — never the caller's.
+5. The response streams back untouched, chunk by chunk.
 
-So the eight envelope keys never vary — `document_type`, `confidence`, `language`,
-`summary`, `fields`, `uncertain_fields`, `unextracted`, `warnings` — and everything
-document-specific lives inside `fields` under fixed conventions (snake_case, ISO 8601
-dates, money as amount plus ISO 4217 currency, `null` rather than omission). Consistency
-comes from the envelope and the conventions rather than from one universal schema. Full
-argument in [SYSTEM_PROMPT.md](SYSTEM_PROMPT.md#why-the-envelope-is-fixed-and-fields-is-not).
-
-### Uncertainty is a separate list, and it took measurement to make it work
-
-Wrapping every value as `{value, confidence}` was the first design. It roughly doubles
-output tokens on a response the user watches stream, and it buries the one 0.41 among
-forty 0.98s, so `uncertain_fields` collects only the exceptions.
-
-The instruction "flag anything you hold below 0.90" then turned out not to work at all —
-on live runs it produced an empty array for every document that did not resemble the
-worked example, including a job listing saying "Equity maybe". Nine concrete triggers
-replaced it (hedge words, ranges, bounds, ambiguous dates, missing units, likely
-misreads, inferred values, contradictions, ambiguous field assignment). Same documents,
-zero flags became two apiece. This is written up with the before and after in
-SYSTEM_PROMPT.md.
-
-### Open WebUI's internal calls must not be injected into
-
-Open WebUI issues its own completions to name each chat, tag it, propose search queries
-and pick an emoji. Those expect small JSON objects of their own, so injecting the
-extraction contract turns every chat title in the sidebar into an extraction envelope.
-
-Open WebUI does label these calls — `metadata.task` in the request body — but its OpenAI
-router runs `metadata = payload.pop("metadata", None)` **before** forwarding upstream, so
-the label never reaches a proxy standing where this one stands. Detection has to match
-the prompt template text instead, and the exact shape of that match matters in both
-directions:
-
-- **A final user message, optionally preceded only by system messages.** Requiring
-  exactly one message looked tighter and was wrong: giving a workspace model a system
-  prompt makes Open WebUI prepend it to every request, task calls included, so detection
-  would have stopped working the moment a user configured a model.
-- **Two signals, not one.** The five templates opening `### Task:` all also carry an
-  `### Output:` section, and both are required — otherwise a person pasting a to-do list
-  that starts "### Task:" would silently get no extraction at all. The three templates
-  with no shared header (emoji, MoA, tool-calling) are matched on openings distinctive
-  enough to stand alone.
-
-All eight of 0.6.5's default templates are covered, read out of the pinned image rather
-than transcribed. Check 6 of `verify.sh` is the live proof this still works.
-
-### Streaming failures are reported differently before and after the first byte
-
-Once `200` and `text/event-stream` are sent, the status line cannot be revised. So the
-proxy pulls the **first chunk before** constructing the streaming response: every
-failure up to that point — a refused connection, a 401, a `context_length_exceeded` —
-still gets a real HTTP status and an OpenAI-shaped error body. It costs no latency,
-because the chunk is forwarded as soon as it arrives.
-
-After the first byte the only channel left is the stream itself, so the proxy emits one
-`data:` event carrying an error object and then `data: [DONE]`. Open WebUI's frontend
-special-cases a frame carrying an `error` key, so this reaches the user as a message
-rather than a silent truncation. The cost is that a mid-stream failure is an HTTP `200`;
-the log line and the error event are the signal.
-
-The terminator is guaranteed on every path that sent bytes, including a 2xx body that
-simply stops — a connection closed cleanly mid-envelope, or something that is not
-OpenAI answering with a JSON or HTML page. Without that a client waits on a stream that
-is never coming back. A 2xx with an *empty* body is caught before anything is sent, so
-it becomes a real `502` rather than a hanging `200`.
-
-### Chunks are forwarded as opaque bytes
-
-The proxy never decodes SSE frames. Parsing would allow logging token counts and
-completion text, but a re-encoding bug would corrupt every response, and Open WebUI
-sends `stream_options.include_usage`, whose final chunk has `"choices": []` — a shape
-that crashes naive `chunk["choices"][0]` handling. Response-side logging is therefore
-limited to byte counts and timing. That is the accepted trade.
-
-Relatedly, response headers on the SSE path are an allowlist rather than a passthrough:
-Open WebUI copies the middleware's headers verbatim onto the response it sends the
-browser, so relaying an upstream `content-encoding` would describe a body that no longer
-matches, and the message would never render. The upstream request asks for `identity`
-encoding so the situation cannot arise.
-
-### The prompt document is the runtime source of truth
-
-`SYSTEM_PROMPT.md` is not a copy of the prompt — the service parses the block between
-two HTML-comment markers out of that file at startup. The document a reviewer reads and
-the bytes sent to OpenAI cannot drift apart. A failed load does not crash the process:
-`/readyz` reports it and the chat route returns `503`, which is more diagnosable than a
-restart loop.
-
-### Liveness and readiness answer different questions
-
-`/healthz` is dependency-free and stays `200` while the process can serve. `/readyz`
-checks local preconditions — prompt loaded, key configured — and returns `503` with a
-per-check breakdown naming what is wrong.
-
-`/readyz` deliberately does **not** call OpenAI. A probe that spends a completion every
-few seconds costs real money, and letting an upstream blip mark every replica unready
-would withdraw the service exactly when it should be returning `502`s and logging why.
-
-The container healthcheck uses `/healthz`, not `/readyz`, for a related reason: Open
-WebUI waits on the middleware being healthy, and gating that on readiness would turn
-"forgot to fill in `.env`" into "Open WebUI never starts" instead of a `503` that names
-the missing key.
-
-### Structured logs cover the full lifecycle, including cancellation
-
-Every line is a single JSON object whose message is an event name, with the request id
-attached from a contextvar. The lifecycle middleware is raw ASGI rather than
-`BaseHTTPMiddleware`, because the latter hands back control as soon as the response
-*starts* — which would report a few milliseconds for a response that streamed for
-thirty seconds. Wrapping `send` gives both time-to-first-byte and the true total.
-
-Cancellation needed explicit handling. A client that disconnects mid-stream never
-produces a final body message, and `asyncio.CancelledError` is a `BaseException` that an
-`except Exception` arm cannot catch — so pressing stop used to log a request that looked
-permanently open. There is now always a terminal event.
-
-An inbound `X-Request-ID` is reused rather than replaced, and echoed on the response.
-
-### Configuration and key handling
-
-The real key reaches the middleware only. Open WebUI gets a literal placeholder, because
-sharing the env file would make the real credential the one Open WebUI presents to this
-proxy and would expose it in Open WebUI's admin UI in the browser. The proxy discards
-the inbound `Authorization` header entirely and authenticates upstream with its own
-configured key.
-
-Timeouts are per-operation with no overall deadline. httpx applies a single value to
-each operation separately, so a total budget would abort a stream that is still
-legitimately producing tokens: connect stays short to fail fast on a dead upstream, and
-read bounds the gap *between* chunks.
-
-`ENABLE_PERSISTENT_CONFIG=false` is set on Open WebUI. It otherwise writes
-`OPENAI_API_BASE_URL` into Postgres on first boot and ignores the environment
-thereafter, so correcting a typo'd base URL appears to do nothing. `docker compose down
--v` is the reset.
-
-Postgres publishes no host port — only Open WebUI talks to it, and 5432 is commonly
-already taken by a local install.
+The prompt itself, and the reasoning behind its design, is in
+**[SYSTEM_PROMPT.md](SYSTEM_PROMPT.md)** — including
+[what actually happened when it was run against GPT](SYSTEM_PROMPT.md#what-the-live-runs-actually-showed),
+which is the honest version: two rules had to be rewritten after measurement, and one
+problem is still open.
 
 ---
 
-## Deliberate omissions
+## Decisions worth knowing about
 
-Not oversights; each is a decision.
+The five that shape everything else. Each one cost something, and the cost is named.
 
-- **No authentication on the proxy.** Both published ports are bound to `127.0.0.1`,
-  so the service is unreachable from the network and a string comparison against a
-  dummy bearer token would buy nothing. The loopback binding is what makes that true —
-  published on `0.0.0.0` this would let anyone on the LAN spend the key with a model of
-  their choosing, so the two decisions travel together.
-- **No request body size limit.** A pasted document is legitimately large and the
-  service is loopback-only, so the body is read whole. A 6MB paste relays OpenAI's own
-  `context_length_exceeded` with container memory flat; the exposure is a local process
-  sending a deliberately huge body.
-- **No retries or circuit breaking.** Retrying a completion risks double-billing, a
-  streamed request cannot be replayed once bytes have shipped, and a silently retrying
-  proxy makes its own latency logs lie. Upstream `429`s and `5xx`s pass through and the
-  user can regenerate.
-- **No rate limiting.** OpenAI's own `429` is the backstop.
-- **No metrics or tracing.** The structured logs meet the brief; a Prometheus exporter
-  would be scope creep here.
-- **No OpenAI endpoints beyond chat completions and model listing.** Nothing else is
-  needed for chat; Open WebUI's default embedding engine is local.
-- **`/v1/models` is served from configuration, not proxied.** It keeps the selector
-  populated when OpenAI is unreachable and keeps the endpoint deterministic under test.
-  The cost: it does not reflect the account's real entitlements, so a model listed in
-  `EXPOSED_MODELS` that the key cannot reach fails at first chat rather than at
-  selection.
-- **No validation of the model's output.** The envelope is a prompt-level contract, not
-  an enforced one. Enforcing it would mean buffering and parsing every response, which
-  the byte-passthrough decision rules out.
+### The output has a fixed shell and a flexible middle
+
+The brief asked for *consistent* JSON and extraction from *any* kind of text. You can't
+have both with one schema — a shape rigid enough to fit a medical note and a shipping
+label either becomes enormous or throws away most of each document.
+
+So the eight outer keys never change, and everything document-specific lives inside
+`fields`, under fixed conventions: snake_case names, ISO 8601 dates, money as an amount
+plus a currency code, `null` rather than a missing key. You can always parse the outside;
+the inside adapts.
+
+### Uncertainty is a short list, not a score on every field
+
+The obvious design is to wrap every value as `{value, confidence}`. It doubles the output
+you sit and watch stream, and it hides the one `0.41` among forty `0.98`s. So only the
+doubtful fields are listed.
+
+Getting that to actually work took measurement. "Flag anything below 0.90" reads
+beautifully and does nothing — on live runs it returned an empty list for every document
+that didn't resemble the worked example, including a job ad that said "Equity maybe". It
+took nine concrete triggers (hedge words, ranges, bounds, ambiguous dates, missing units,
+likely misreads, inferred values, contradictions) to fix. Same documents, zero flags
+became two apiece.
+
+### Open WebUI talks to itself, and must not be interrupted
+
+After every message, Open WebUI quietly asks the model to name the chat, tag it, and
+suggest searches. Those calls expect a small JSON object of their own. Inject the
+extraction prompt into them and every chat in your sidebar gets named with a JSON blob.
+
+Open WebUI does label these calls — and then strips the label before forwarding, so a
+proxy standing here never sees it. Detection has to read the prompt text instead, which
+makes the *shape* of the match load-bearing in both directions:
+
+- **Too strict** and it breaks the moment you give a model a system prompt, because Open
+  WebUI starts prepending that to every request including these.
+- **Too loose** and a person who pastes a to-do list beginning "### Task:" silently gets
+  no extraction at all.
+
+It matches a final user message, optionally preceded only by system messages, carrying
+both of the markers the real templates use. All eight of Open WebUI 0.6.5's templates are
+covered, read out of the running image rather than transcribed. Check 6 of `verify.sh`
+exists to catch this breaking.
+
+### Failures are reported differently before and after the first byte
+
+Once a `200` and "this is a stream" have gone out, you can't take the status code back.
+So the proxy waits for the first chunk *before* it commits: anything that goes wrong up
+to that point — refused connection, bad key, document too long — still gets a real HTTP
+status. It costs nothing, because that chunk is forwarded the instant it lands.
+
+After the first byte, the only channel left is the stream itself, so a failure becomes an
+error event followed by a terminator. Open WebUI shows a message instead of a reply that
+just stops. The price: a mid-stream failure is technically an HTTP `200`, and the logs are
+where the truth lives.
+
+The terminator is guaranteed on every path that sent anything — including a response that
+simply stops, which would otherwise leave the browser spinning forever.
+
+### The response is never re-encoded
+
+Chunks are forwarded as opaque bytes. Parsing them would allow logging token counts, but a
+re-encoding bug would corrupt every answer, and OpenAI sends a final chunk with an empty
+`choices` list that naive parsing crashes on. The trade: response-side logging is limited
+to counts and timing, and nothing validates the model's output shape.
+
+---
+
+## When something goes wrong
+
+Every log line is one JSON object, and every line from one request shares a `request_id`.
+That id is also in the `x-request-id` response header **and** inside any error the browser
+shows you — so a user-visible failure is one search away from its explanation.
+
+```bash
+docker compose logs -f middleware                          # follow everything
+docker compose logs middleware | grep '"request_id":"abc"' # one request, start to finish
+docker compose logs middleware | grep service.starting     # what config is it running?
+```
+
+That last one is the first thing to check when behaviour makes no sense — it prints every
+effective setting at startup, with the key reduced to a length so nothing leaks.
+
+**What the events mean:**
+
+| Event | Says |
+| --- | --- |
+| `service.starting` | every effective setting, key masked |
+| `chat.request` | model, streaming or not, how much history, whether the prompt went in |
+| `prompt.injection.skipped` | and *why* — usually an Open WebUI task call |
+| `upstream.response` | what OpenAI answered |
+| `chat.completed` | tokens used, and `truncated: true` if the answer was cut off |
+| `chat.stream.finished` | how many chunks got through — logged even if you hit stop |
+| `upstream.stream.abandoned` | you hit stop; the upstream call was released |
+| `upstream.stream.interrupted` | OpenAI died mid-answer |
+| `http.request.cancelled` | the request ended without a normal response |
+
+**Common symptoms:**
+
+| You see | It's probably |
+| --- | --- |
+| Empty model dropdown | `EXPOSED_MODELS`, or the middleware is down — run `verify.sh` |
+| Every chat named with JSON | injection scoping broke — check 6 of `verify.sh` |
+| Answers stop halfway | look for `truncated: true` in `chat.completed` |
+| Changed a setting, nothing happened | Open WebUI pins its config in Postgres — `docker compose down -v` |
+| `verify.sh` exits 3 | your OpenAI account, not this code |
+
+---
+
+## Not included, on purpose
+
+- **No login on the proxy.** Both ports are bound to `127.0.0.1`, so nothing off-machine
+  can reach it. That binding is what makes skipping auth defensible — published to the
+  network, this would let anyone spend your key. The two decisions travel together.
+- **No retries.** Retrying a completion risks paying twice, a half-sent stream can't be
+  replayed, and a silently-retrying proxy makes its own timing logs lie. Failures surface;
+  you press regenerate.
+- **No metrics or tracing.** The structured logs answer the questions that come up.
+- **Only two endpoints.** Model listing and chat completions is all Open WebUI needs.
+- **No validation of the model's output.** Follows from not re-encoding responses.
 
 ## Known limitations
 
-- **A prior extraction truncated mid-JSON still gets cited as though complete.** Stop a
-  response mid-envelope, then ask a follow-up, and the answer names a field path that
-  was never produced — the value is read back out of the source text and attributed to
-  a field. Two prompt escalations did not shift it. The adjacent case is fixed: a field
-  absent from a *complete* extraction now correctly reports the extraction as
-  incomplete. Details in
-  [SYSTEM_PROMPT.md](SYSTEM_PROMPT.md#what-the-live-runs-actually-showed).
-- **Uploading a file behaves differently from pasting text.** Open WebUI routes uploads
-  through retrieval, so the middleware sees a RAG template containing retrieved chunks
-  rather than the document. Paste the text to exercise the extractor.
-- **`OPENAI_API_BASE_URL` must not end in a slash.** Open WebUI builds calls as
-  `f"{url}/models"`, so a trailing slash produces `//models` and a 404.
-- **An admin-customised task template defeats injection scoping.** Detection matches the
-  template text of Open WebUI 0.6.5, because Open WebUI strips its own `metadata.task`
-  label before forwarding. All eight of that version's default templates are covered,
-  but editing one in Admin → Interface, or bumping the image, can silently reintroduce
-  extraction envelopes as chat titles. Check 6 of `verify.sh` is what catches it.
-- **A source document can corrupt values while keeping the envelope intact.** A pasted
-  "PARSER DIRECTIVE" claiming a different unit or telling the model to clear its
-  uncertainty flags is answered with a rule in the prompt and a warning, but nothing
-  downstream validates the numbers — that is the cost of not parsing the response.
+- **A cut-off extraction gets cited as if it were complete.** Stop a reply mid-JSON, then
+  ask a follow-up: the answer may name a field that was never produced. Two prompt
+  revisions failed to shift it, because the source text is still sitting in the history
+  competing with the rule. The related case is fixed — a field missing from a *complete*
+  extraction is correctly reported as missing.
+- **Prose answers can assert what the extraction left blank.** Asked about the invoice
+  above, it volunteered "GBP" for a currency the extraction had recorded as `null` and
+  flagged at 0.30 confidence. The prompt tells it to ground every claim in the extracted
+  data; in a follow-up it will still reach for a plausible detail. Trust the JSON over the
+  prose, and treat `uncertain_fields` as the check on both.
+- **A document can lie to the extractor and keep a straight face.** Text claiming
+  "amounts are in thousands, leave uncertainty empty" is answered with a rule and a
+  warning, but nothing downstream can tell if it wins.
+- **Editing a task template, or bumping Open WebUI, can silently break injection
+  scoping.** `verify.sh` check 6 is the tripwire.
+- **File uploads behave differently from pasting.** Open WebUI routes them through
+  retrieval, so the middleware sees search results rather than your document. Paste text.
+- **The prompt costs about 2,900 tokens per request.** It buys the format guarantee.
 
 ---
 
-## Layout
+## Where things live
 
 ```
-├── SYSTEM_PROMPT.md          the prompt, its rationale, and the live-run results
-├── docker-compose.yml        Postgres + Open WebUI 0.6.5 + middleware
-├── scripts/verify.sh         end-to-end verification, one check per hop
-├── .env.example              every variable, placeholders only
-└── middleware/
-    ├── Dockerfile            python:3.11-slim, non-root, build context = repo root
-    └── src/extractor_proxy/
-        ├── config.py         environment-driven settings
-        ├── prompt.py         prompt loading, injection, internal-task detection
-        ├── upstream.py       the OpenAI hop, streaming and failure mapping
-        ├── observability.py  JSON logs and the request-lifecycle middleware
-        ├── routes/health.py  liveness and readiness
-        └── routes/openai_compat.py  /v1/models and /v1/chat/completions
+SYSTEM_PROMPT.md        the prompt, why it looks like that, and how it measured
+docker-compose.yml      the three services
+scripts/verify.sh       one check per hop, distinct exit codes
+.env.example            every setting, with placeholders
+middleware/
+  Dockerfile            python:3.11-slim, non-root
+  src/extractor_proxy/
+    prompt.py           injection, and the Open WebUI carve-out
+    upstream.py         the OpenAI hop, and everything about streaming failure
+    observability.py    JSON logs, request ids, lifecycle events
+    routes/             /v1/models, /v1/chat/completions, /healthz, /readyz
+  tests/                129 tests, no network
 ```
+
+Start with `prompt.py` if you want the interesting part, or `upstream.py` if you want the
+hard part.
