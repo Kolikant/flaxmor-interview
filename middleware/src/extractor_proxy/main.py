@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from extractor_proxy import __version__
 from extractor_proxy.config import Settings, get_settings
 from extractor_proxy.errors import error_envelope
-from extractor_proxy.observability import RequestLifecycleMiddleware
+from extractor_proxy.observability import REQUEST_ID_HEADER, RequestLifecycleMiddleware
 from extractor_proxy.prompt import PromptUnavailableError, load_system_prompt
 from extractor_proxy.routes import health, openai_compat
 from extractor_proxy.upstream import UpstreamClient
@@ -96,9 +96,20 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
         # The lifecycle middleware has already logged this with the request id; the
         # exception type is deliberately not echoed to the client.
+        #
+        # Starlette routes this handler to ServerErrorMiddleware, outside the lifecycle
+        # middleware, so the contextvar is already reset and the response bypasses the
+        # header-stamping wrapper. The id is read back off the scope and applied by
+        # hand — an unhandled 500 is precisely when a correlation id is most wanted, so
+        # it must not be the one response that lacks it.
+        request_id = (request.scope.get("state") or {}).get("request_id")
+        envelope = error_envelope("The proxy failed to handle this request.", "internal_error")
+        if request_id:
+            envelope["error"]["request_id"] = request_id
         return JSONResponse(
-            error_envelope("The proxy failed to handle this request.", "internal_error"),
+            envelope,
             status_code=500,
+            headers={REQUEST_ID_HEADER: request_id} if request_id else None,
         )
 
 

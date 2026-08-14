@@ -482,3 +482,32 @@ def test_a_stream_reports_how_far_it_got(caplog):
     finished = log_events(caplog)["chat.stream.finished"]
     assert finished.chunks == len(STREAM_CHUNKS)
     assert finished.forwarded_bytes == sum(len(c) for c in STREAM_CHUNKS)
+
+
+def test_a_non_list_messages_value_does_not_crash_the_log_line():
+    # {"messages": 5} is valid JSON and a plausible client mistake. Counting it for the
+    # chat.request log raised TypeError and turned a log line into a 500.
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": 5})
+
+    assert response.status_code != 500
+
+
+def test_an_unhandled_error_still_carries_the_request_id():
+    # Starlette routes the Exception handler to ServerErrorMiddleware, outside the
+    # lifecycle middleware — so this response bypasses both the contextvar and the
+    # header stamping. An unhandled 500 is exactly when a correlation id matters most.
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION))
+
+    @app.get("/boom")
+    async def boom() -> dict:
+        raise RuntimeError("deliberate")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/boom", headers={"X-Request-ID": "trace-me"})
+
+    assert response.status_code == 500
+    assert response.headers["x-request-id"] == "trace-me"
+    assert response.json()["error"]["request_id"] == "trace-me"

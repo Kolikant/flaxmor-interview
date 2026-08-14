@@ -156,6 +156,11 @@ class RequestLifecycleMiddleware:
 
         request_id = _inbound_request_id(scope) or uuid.uuid4().hex
         token = request_id_var.set(request_id)
+        # Also on the scope, because Starlette routes an `Exception` handler to
+        # ServerErrorMiddleware, which sits *outside* this middleware: by the time it
+        # runs, the contextvar below has been reset and the response never passes
+        # through send_wrapper. The scope is the only channel that survives.
+        scope.setdefault("state", {})["request_id"] = request_id
         started = time.perf_counter()
 
         method = scope.get("method", "")

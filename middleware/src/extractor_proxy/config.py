@@ -121,6 +121,7 @@ class Settings(BaseSettings):
             "max_request_bytes": self.max_request_bytes,
             "system_prompt_path": str(self.system_prompt_path),
             "log_level": self.log_level,
+            "service_name": self.service_name,
             "host": self.host,
             "port": self.port,
         }

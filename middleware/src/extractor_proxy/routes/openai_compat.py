@@ -118,7 +118,9 @@ async def chat_completions(request: Request) -> Response:
             "model": payload.get("model"),
             "streaming": streaming,
             "request_bytes": len(body),
-            "message_count": len(payload.get("messages") or []),
+            # Only a list has a meaningful count, and `{"messages": 5}` is valid JSON:
+            # len() on it raised, turning a log line into a 500.
+            "message_count": len(messages) if isinstance(messages := payload.get("messages"), list) else None,
             "prompt_injected": injected is not payload,
         },
     )
