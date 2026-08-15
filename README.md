@@ -55,6 +55,10 @@ Authentication is not required — the proxy uses its own configured key and ign
 
 Add `"stream": true` for a Server-Sent Events response.
 
+`Content-Type: application/json` is required — anything else is refused with `415`. That
+is deliberate: without it a `text/plain` POST would be a CORS *simple* request, which any
+web page could fire at the loopback port with no preflight and spend the configured key.
+
 ### Output format
 
 Every extraction returns these eight keys, always present and always in this order:
@@ -161,6 +165,7 @@ outage does not mark the container unready.
 | `200` | success, or a mid-stream failure reported in-band |
 | `400` | body is not valid JSON, or not a JSON object |
 | `413` | body exceeds `MAX_REQUEST_BYTES` |
+| `415` | `Content-Type` is not `application/json` |
 | `502` | OpenAI unreachable, empty stream, or a non-JSON upstream body |
 | `503` | `SYSTEM_PROMPT.md` failed to load |
 | `504` | upstream timed out |
@@ -220,9 +225,11 @@ docker compose logs middleware | grep service.starting        # effective config
 
 | Event | Level | Meaning |
 | --- | --- | --- |
-| `service.starting` | INFO | every effective setting; the key appears only as a length |
+| `service.starting` | INFO | every effective setting; the key appears only as presence and length |
+| `service.stopped` | INFO | lifespan teardown |
+| `prompt.load.ok` / `.failed` | INFO/ERROR | whether SYSTEM_PROMPT.md parsed, and why not |
 | `chat.request` | INFO | model, streaming, request size, message count, whether injected |
-| `chat.rejected` | WARN | body over the size limit |
+| `chat.rejected` | WARN | refused before reaching OpenAI — size, media type, or malformed body |
 | `chat.refused` | ERROR | prompt document unavailable |
 | `chat.completed` | INFO | `finish_reason`, token usage, `truncated` |
 | `chat.stream.finished` | INFO | chunks and bytes forwarded; logged on disconnect too |
@@ -235,6 +242,7 @@ docker compose logs middleware | grep service.starting        # effective config
 | `upstream.stream.empty` | WARN | 2xx with no body |
 | `upstream.stream.abandoned` | INFO | consumer disconnected; upstream released |
 | `http.request.start` / `.end` | INFO | lifecycle, with duration and byte count |
+| `http.response.start` | INFO | status and time to first byte |
 | `http.request.cancelled` | WARN | ended without a normal response |
 | `http.request.failed` | ERROR | unhandled exception, with traceback |
 
@@ -271,7 +279,7 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-135 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
+147 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
 streams that fail mid-flight, end without a terminator, and are abandoned by a cancelled
 consumer.
 
@@ -328,3 +336,96 @@ middleware/
     routes/openai_compat.py  /v1/models, /v1/chat/completions
   tests/
 ```
+
+---
+
+## Design decisions
+
+Each entry is the choice, the alternative it was taken over, and what it cost.
+
+### A fixed envelope with a document-shaped body
+
+The brief asks for *consistent* JSON and extraction from *any* text. One schema cannot do
+both — a shape rigid enough for a medical note and a shipping label is either enormous or
+throws most of each document away. So the eight outer keys never vary and everything
+document-specific lives in `fields`, under fixed conventions.
+
+**Cost:** only the envelope is truly schema-stable. A consumer wanting a specific field
+still has to know the document type.
+
+### Uncertainty as a list of exceptions
+
+The alternative is `{value, confidence}` on every field. That doubles output tokens on a
+response the user watches stream, and hides the one `0.41` among forty `0.98`s.
+
+**Cost:** asking "how confident about field X" means searching a list. And an empty array
+is a strong claim the model has to actually honour — it did not at first, which is why
+the prompt now names nine concrete triggers instead of a confidence threshold. Asking a
+model to introspect a number turned out to be close to unactionable.
+
+### Responses are relayed, never re-encoded
+
+Streamed chunks are forwarded as opaque bytes; non-streaming bodies go back verbatim.
+Parsing would allow richer response logging, but a re-encoding bug corrupts every
+response, and OpenAI sends a final chunk with an empty `choices` list that naive parsing
+crashes on.
+
+**Cost:** response-side logging is limited to counts and timing, and nothing validates the
+model's output shape. The non-streaming path parses a copy for logging only.
+
+### Failures are reported differently either side of the first byte
+
+Once `200` and `text/event-stream` are sent the status cannot be revised, so the proxy
+pulls the first chunk *before* committing the response. Everything that fails up to that
+point gets a real HTTP status; after it, failures become an in-band SSE error frame plus a
+terminator, which Open WebUI's frontend recognises.
+
+**Cost:** a mid-stream failure is an HTTP `200`, and the logs are where the truth lives.
+This split turned out to be the highest-leverage structural decision here — most streaming
+defects found later were about which side of that line a case fell on.
+
+### A static model list
+
+`/v1/models` is served from configuration with no upstream call, so the selector stays
+populated when OpenAI is unreachable and the endpoint is deterministic under test.
+
+**Cost:** it does not reflect the account's real entitlements, so an unreachable model
+fails at first chat rather than at selection.
+
+### No inbound authentication, and loopback binding
+
+Open WebUI holds a placeholder key, so validating it proves nothing. Both published ports
+are bound to `127.0.0.1` instead.
+
+**Cost, and the lesson:** these are one decision, not two. An earlier version argued "no
+auth because it's a local stack" while compose published on `0.0.0.0` — the decision was
+fine, the premise was false. Loopback alone also does not exclude the browser, which is
+why `application/json` is required (making a cross-origin POST non-simple) and why the
+`Host` header is checked. `verify.sh` now asserts the binding rather than trusting a
+comment.
+
+### No retries
+
+Retrying a completion risks paying twice, a partially-sent stream cannot be replayed, and
+a silently-retrying proxy makes its own latency logs lie.
+
+**Cost:** a transient upstream blip reaches the user as an error.
+
+### SYSTEM_PROMPT.md is the runtime source of truth
+
+The service parses the prompt out of the repository document at startup rather than
+holding a copy in Python. The brief requires that document; a constant beside it is free
+to drift, and a stale prompt document describes behaviour the service does not have.
+
+**Cost:** a startup file read, a small parser, and a packaging concern — the container
+copies the document in and sets `SYSTEM_PROMPT_PATH`, because the path-discovery walk
+cannot work from inside site-packages.
+
+### Raw ASGI middleware rather than `BaseHTTPMiddleware`
+
+`BaseHTTPMiddleware` returns control when the response *starts*, which would report a few
+milliseconds for a response that streamed for thirty seconds.
+
+**Cost:** more code, and it has to handle ASGI details the framework would otherwise hide.
+Both bit at least once — a client disconnect arrives as `CancelledError`, not
+`GeneratorExit`, and an unhandled exception is handled outside this middleware entirely.
