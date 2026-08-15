@@ -112,10 +112,13 @@ def configure_logging(level: str = "INFO", service_name: str = "extractor-proxy"
         uvicorn_logger.handlers = []
         uvicorn_logger.propagate = True
 
-    # httpx logs one INFO line per request ("HTTP Request: POST ... 200 OK") that says
-    # strictly less than the upstream.response event beside it, and carries no request
-    # id. Warnings and above still come through.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # The client logs one INFO line per request ("HTTP Request: POST ... 200 OK") that
+    # says strictly less than the upstream.response event beside it. Both names are
+    # silenced because the package is httpx2 — targeting only "httpx" silenced nothing,
+    # and the check that was supposed to confirm it only ever exercised an endpoint
+    # that makes no upstream call. Warnings and above still come through.
+    for client_logger in ("httpx", "httpx2"):
+        logging.getLogger(client_logger).setLevel(logging.WARNING)
 
 
 #: An inbound trace id is caller-controlled and gets both echoed into a response

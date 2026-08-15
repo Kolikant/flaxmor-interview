@@ -337,7 +337,7 @@ def test_a_messages_list_holding_non_objects_is_not_a_500():
 
     # Forwarded so OpenAI answers with its own validation error, per the pass-through
     # rule for malformed message lists — the one thing it must not be is a 500.
-    assert response.status_code != 500
+    assert response.status_code == 200
     assert seen[0]["messages"] == ["hi"]
 
 
@@ -487,7 +487,7 @@ def test_a_non_list_messages_value_does_not_crash_the_log_line():
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post("/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": 5})
 
-    assert response.status_code != 500
+    assert response.status_code == 200
 
 
 def test_an_unhandled_error_still_carries_the_request_id():
@@ -541,3 +541,45 @@ def test_a_completion_with_a_malformed_usage_field_still_succeeds():
 
     assert response.status_code == 200
     assert response.json() == odd
+
+
+def test_a_non_json_content_type_is_refused():
+    # Without this, a text/plain POST is a CORS *simple* request: any page the operator
+    # visits can fire it cross-origin with no preflight, and it reaches OpenAI on the
+    # configured key. Verified returning 200 before the check existed.
+    handler, seen = recording_handler()
+
+    with TestClient(build_app(handler)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=b'{"model":"gpt-4o-mini","messages":[]}',
+            headers={"content-type": "text/plain;charset=UTF-8"},
+        )
+
+    assert response.status_code == 415
+    assert seen == []
+
+
+def test_a_json_content_type_with_a_charset_is_accepted():
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            content=b'{"model":"gpt-4o-mini","messages":[{"role":"user","content":"x"}]}',
+            headers={"content-type": "application/json; charset=utf-8"},
+        )
+
+    assert response.status_code == 200
+
+
+def test_an_unexpected_host_header_is_refused():
+    # An arbitrary Host is the missing precondition for DNS rebinding against a
+    # loopback-bound service: a hostile name resolving to 127.0.0.1 would otherwise be
+    # same-origin to a browser.
+    app = build_app(lambda r: httpx.Response(200, json=COMPLETION))
+
+    with TestClient(app) as client:
+        response = client.get("/healthz", headers={"host": "evil.example.com"})
+
+    assert response.status_code == 400

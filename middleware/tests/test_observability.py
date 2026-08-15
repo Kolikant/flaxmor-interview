@@ -314,3 +314,39 @@ def test_an_inbound_request_id_is_sanitised(inbound, expected):
         assert returned and returned != inbound
     else:
         assert returned == expected
+
+
+def test_a_key_inside_a_traceback_is_masked(json_logger):
+    # The formatter renders exc_info into an `error.stack` string, which redaction has
+    # to cover as much as the fields beside it.
+    logger, lines = json_logger
+
+    try:
+        raise ValueError("upstream rejected sk-proj-AbCdEfGhIjKlMnOpQrSt")
+    except ValueError:
+        logger.exception("upstream.failed")
+
+    (entry,) = lines()
+    blob = json.dumps(entry)
+    assert "sk-proj-AbCdEfGhIjKlMnOpQrSt" not in blob
+    assert "redacted" in blob
+
+
+def test_the_http_client_logger_is_silenced_by_name():
+    # The package is httpx2, so silencing only "httpx" silenced nothing — and the check
+    # that was meant to confirm it exercised an endpoint that makes no upstream call.
+    import logging as stdlib_logging
+
+    from extractor_proxy.observability import configure_logging
+
+    previous = {
+        name: stdlib_logging.getLogger(name).level for name in ("httpx", "httpx2")
+    }
+    try:
+        configure_logging(level="INFO", service_name="test")
+        assert stdlib_logging.getLogger("httpx2").level == stdlib_logging.WARNING
+        assert stdlib_logging.getLogger("httpx").level == stdlib_logging.WARNING
+    finally:
+        for name, level in previous.items():
+            stdlib_logging.getLogger(name).setLevel(level)
+        stdlib_logging.getLogger().handlers = []

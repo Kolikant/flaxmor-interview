@@ -247,10 +247,15 @@ else
     "")   warn "Open WebUI has no OPENAI_API_KEY set; it will not reach the middleware" ;;
     *)    ok "Open WebUI holds a placeholder, not the real key" ;;
   esac
-  if docker compose port middleware 8000 2>/dev/null | grep -qv '^127\.0\.0\.1:'; then
-    warn "the middleware port is published beyond loopback; it holds the key and has no inbound auth"
+  # grep -v exits 1 on empty input, so "no output" took the else branch and printed a
+  # green tick having observed nothing — the same vacuous-pass shape as check 6 once had.
+  mapping=$(docker compose port middleware 8000 2>/dev/null)
+  if [ -z "$mapping" ]; then
+    warn "could not read the middleware port mapping; loopback binding was NOT verified"
+  elif printf '%s\n' "$mapping" | grep -qv '^127\.0\.0\.1:'; then
+    die "the middleware port is published beyond loopback ($mapping); it holds the key and has no inbound auth"
   else
-    ok "the middleware port is bound to loopback"
+    ok "the middleware port is bound to loopback ($mapping)"
   fi
 fi
 

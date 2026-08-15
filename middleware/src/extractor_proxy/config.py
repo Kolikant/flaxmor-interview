@@ -46,6 +46,11 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # pydantic embeds the offending input in every ValidationError. Without this,
+        # rejecting a credential-bearing OPENAI_BASE_URL printed that credential in
+        # full — and settings are read before logging is configured, so it reached
+        # stderr with no redaction. The validator existed to prevent exactly that.
+        hide_input_in_errors=True,
     )
 
     # Upstream OpenAI credentials. The key is never defaulted to a usable value: the

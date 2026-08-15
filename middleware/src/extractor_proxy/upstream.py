@@ -22,7 +22,16 @@ logger = logging.getLogger("extractor_proxy.upstream")
 
 #: Terminator every OpenAI-compatible SSE stream ends with. Open WebUI waits for it.
 SSE_DONE = b"data: [DONE]\n\n"
-SSE_DONE_MARKER = b"[DONE]"
+
+#: The terminator is recognised as a *frame at the end of the stream*, not as a
+#: substring anywhere in it. Two ways the looser check went wrong, both reproduced:
+#: a document containing the literal text "[DONE]" — entirely plausible for a proxy
+#: whose job is extracting pasted text — satisfied it, so a stream that then ended
+#: unterminated got no synthetic terminator; and a real terminator split across two
+#: chunks satisfied neither, producing a spurious error frame on a healthy stream.
+#: Keeping a short tail of the stream answers both.
+SSE_DONE_FRAME = b"data: [DONE]"
+_TAIL_BYTES = 64
 
 
 JSON_MEDIA_TYPE = "application/json"
@@ -206,7 +215,7 @@ class UpstreamClient:
         the client waiting on a stream that is never coming back.
         """
         sent_any = False
-        saw_done = False
+        tail = b""
         try:
             async with self.http_client.stream(
                 "POST", self._chat_url, json=payload, headers=self._headers
@@ -227,9 +236,10 @@ class UpstreamClient:
                 )
                 async for chunk in response.aiter_bytes():
                     sent_any = True
-                    # A substring check on opaque bytes, not SSE parsing: enough to
-                    # know the stream terminated itself, without decoding frames.
-                    saw_done = saw_done or SSE_DONE_MARKER in chunk
+                    # Keep only the tail. Whether the stream terminated itself is a
+                    # question about how it *ended*, so earlier content cannot answer
+                    # it — and a terminator split across two chunks still can.
+                    tail = (tail + chunk)[-_TAIL_BYTES:]
                     yield chunk
 
                 if not sent_any:
@@ -260,7 +270,7 @@ class UpstreamClient:
             yield SSE_DONE
             return
 
-        if not saw_done:
+        if not tail.rstrip().endswith(SSE_DONE_FRAME):
             logger.warning("upstream.stream.unterminated")
             yield _sse_error("The upstream response ended without a terminator.")
             yield SSE_DONE

@@ -46,7 +46,7 @@ def _too_large(limit: int, **context: object) -> JSONResponse:
     )
 
 
-async def _read_capped(request: Request, limit: int) -> bytes | None:
+async def _read_capped(request: Request, limit: int) -> tuple[bytes | None, int]:
     """Read the request body, stopping as soon as it passes the limit.
 
     `request.body()` buffers the whole thing before anything can object, so the ceiling
@@ -54,16 +54,17 @@ async def _read_capped(request: Request, limit: int) -> bytes | None:
     case the declared-length check below cannot cover. Reading the stream keeps the
     guarantee the setting actually claims.
 
-    Returns None when the limit is exceeded.
+    Returns (None, bytes_seen) when the limit is exceeded, so the caller can log what
+    was actually read rather than repeating the limit back.
     """
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
         if total > limit:
-            return None
+            return None, total
         chunks.append(chunk)
-    return b"".join(chunks)
+    return b"".join(chunks), total
 
 
 async def _validated_body(request: Request, limit: int) -> tuple[bytes, dict[str, Any]] | JSONResponse:
@@ -73,21 +74,39 @@ async def _validated_body(request: Request, limit: int) -> tuple[bytes, dict[str
     Separated from the route so `chat_completions` reads as what it actually does:
     decide whether to inject, then relay.
     """
+    # Requiring JSON is a security control, not pedantry. Without it, a POST carrying
+    # `text/plain` is a CORS *simple* request: any page the operator visits can fire it
+    # cross-origin with no preflight, and it reaches OpenAI on the configured key.
+    # Verified before this check existed — a text/plain POST with a foreign Origin
+    # returned 200. Demanding application/json makes such a request non-simple, so the
+    # browser must preflight, and nothing here answers OPTIONS. Open WebUI already
+    # sends application/json, so this costs nothing.
+    media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if media_type and not (media_type == "application/json" or media_type.endswith("+json")):
+        logger.warning("chat.rejected", extra={"reason": "unsupported_media_type"})
+        return _error(
+            415,
+            "Content-Type must be application/json.",
+            "invalid_request_error",
+        )
+
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
         # Cheap pre-check: refuse an honestly-declared oversized body without reading it.
         return _too_large(limit, content_length=int(declared))
 
-    body = await _read_capped(request, limit)
+    body, bytes_read = await _read_capped(request, limit)
     if body is None:
-        return _too_large(limit, body_bytes=f"over {limit}")
+        return _too_large(limit, body_bytes=bytes_read)
 
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("chat.rejected", extra={"reason": "invalid_json"})
         return _error(400, "Request body is not valid JSON.", "invalid_request_error")
 
     if not isinstance(payload, dict):
+        logger.warning("chat.rejected", extra={"reason": "not_an_object"})
         return _error(400, "Request body must be a JSON object.", "invalid_request_error")
 
     return body, payload
@@ -126,7 +145,10 @@ async def chat_completions(request: Request) -> Response:
     if state.system_prompt is None:
         # Relaying without the prompt would quietly turn the product into a plain
         # GPT proxy, which is a worse failure than refusing.
-        logger.error("chat.refused", extra={"reason": "prompt_unavailable"})
+        logger.error(
+            "chat.refused",
+            extra={"reason": "prompt_unavailable", "detail": state.system_prompt_error},
+        )
         return _error(
             503,
             f"The extraction prompt is unavailable: {state.system_prompt_error}",

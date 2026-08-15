@@ -323,3 +323,35 @@ async def test_the_parsed_body_is_carried_rather_than_re_derived():
 
     assert response.payload == COMPLETION
     assert json.loads(response.content) == response.payload
+
+
+async def test_content_containing_the_terminator_text_does_not_suppress_the_guarantee():
+    # This proxy's whole job is extracting pasted text, so a document containing the
+    # literal "[DONE]" is ordinary input. A substring check anywhere in the stream let
+    # it satisfy the terminator condition, and a stream that then ended unterminated
+    # got nothing appended — reintroducing the silent truncation this feature prevents.
+    client = build_client(
+        lambda request: httpx.Response(
+            200, content=sse(b'data: {"choices":[{"delta":{"content":"status: [DONE]"}}]}\n\n')
+        )
+    )
+
+    received = b"".join([chunk async for chunk in client.stream_chat_completion(PAYLOAD)])
+
+    assert received.rstrip().endswith(b"data: [DONE]")
+    assert b"upstream_stream_interrupted" in received
+
+
+async def test_a_terminator_split_across_two_chunks_is_recognised():
+    # Chunk boundaries follow the upstream's write boundaries, not frame boundaries. A
+    # per-chunk check saw neither half and appended a spurious error to a healthy stream.
+    client = build_client(
+        lambda request: httpx.Response(
+            200, content=sse(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DO', b"NE]\n\n")
+        )
+    )
+
+    received = b"".join([chunk async for chunk in client.stream_chat_completion(PAYLOAD)])
+
+    assert received.rstrip().endswith(b"data: [DONE]")
+    assert b"upstream_stream_interrupted" not in received

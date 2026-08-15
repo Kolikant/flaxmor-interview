@@ -205,3 +205,17 @@ def test_a_conversation_ending_in_an_assistant_turn_is_not_a_task_request():
     ]
 
     assert is_internal_task_request(messages) is False
+
+
+def test_a_real_prior_user_turn_prevents_task_detection():
+    # The system-message allowance exists for a workspace model's own prompt. A genuine
+    # conversation whose latest message happens to look like a template is still a real
+    # turn, and must be extracted.
+    messages = [
+        {"role": "user", "content": "here is my invoice"},
+        {"role": "assistant", "content": '{"document_type": "invoice"}'},
+        {"role": "user", "content": TITLE_TEMPLATE},
+    ]
+
+    assert is_internal_task_request(messages) is False
+    assert inject_system_prompt({"messages": messages}, PROMPT)["messages"][0]["content"] == PROMPT

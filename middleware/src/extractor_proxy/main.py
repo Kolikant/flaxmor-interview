@@ -14,6 +14,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from extractor_proxy import __version__
 from extractor_proxy.config import Settings, get_settings
 from extractor_proxy.errors import error_envelope
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
 from extractor_proxy.observability import REQUEST_ID_HEADER, RequestLifecycleMiddleware
 from extractor_proxy.prompt import PromptUnavailableError, load_system_prompt
 from extractor_proxy.routes import health, openai_compat
@@ -71,6 +73,14 @@ def create_app(settings: Settings | None = None, upstream: UpstreamClient | None
     app.include_router(health.router)
     app.include_router(openai_compat.router)
     app.add_middleware(RequestLifecycleMiddleware)
+    # An arbitrary Host header was accepted, which is what turns a loopback-bound
+    # service into a DNS-rebinding target: a hostile name resolving to 127.0.0.1 lets a
+    # browser reach it as same-origin and read responses. The service is only ever
+    # addressed as localhost, or as `middleware` on the compose network.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "middleware", "testserver"],
+    )
     _install_error_handlers(app)
     return app
 
@@ -145,7 +155,12 @@ def _read_prompt(settings: Settings) -> tuple[str | None, str | None]:
     try:
         prompt = load_system_prompt(settings.system_prompt_path)
     except PromptUnavailableError as exc:
-        logger.error("prompt.load.failed", extra={"prompt_path": str(settings.system_prompt_path)})
+        logger.error(
+            "prompt.load.failed",
+            # The reason, not just the fact: otherwise the log says startup failed and
+            # an operator has to curl /readyz to learn why.
+            extra={"prompt_path": str(settings.system_prompt_path), "reason": str(exc)},
+        )
         return None, str(exc)
 
     logger.info(

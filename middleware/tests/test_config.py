@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+from pydantic import ValidationError
+
 from extractor_proxy import config
 from extractor_proxy.config import (
     PROMPT_FILENAME,
@@ -99,3 +104,37 @@ def test_the_fallback_is_absolute_so_the_error_names_a_real_path(tmp_path, monke
 
     assert fallback.is_absolute()
     assert fallback.name == PROMPT_FILENAME
+
+
+def test_a_base_url_embedding_credentials_is_refused():
+    # httpx logs request URLs without masking userinfo, so this would put a credential
+    # into the log stream of a service that is otherwise careful never to log one.
+    with pytest.raises(ValidationError):
+        Settings(openai_api_key="sk-test", openai_base_url="https://u:pw@api.openai.com/v1")
+
+
+def test_the_rejection_message_does_not_contain_the_credential():
+    # pydantic embeds the offending input in every ValidationError, so the validator
+    # written to keep a credential out of the logs was printing one — and settings are
+    # read before logging is configured, so it reached stderr unredacted.
+    try:
+        Settings(openai_api_key="sk-test", openai_base_url="https://u:hunter2@api.openai.com/v1")
+    except ValidationError as exc:
+        assert "hunter2" not in str(exc)
+    else:
+        pytest.fail("a credential-bearing base URL should be refused")
+
+
+def test_a_clean_base_url_still_passes():
+    assert Settings(openai_base_url="https://api.openai.com/v1/").openai_base_url.endswith("/v1")
+
+
+def test_the_startup_summary_never_carries_the_key():
+    # This is what gets logged at startup, so it is the one place a key would leak in
+    # plain sight if the summary ever grew a field.
+    key = "sk-proj-DistinctiveValueForThisTest"
+    summary = Settings(openai_api_key=key).redacted_summary()
+
+    assert key not in json.dumps(summary)
+    assert summary["openai_api_key_present"] is True
+    assert summary["openai_api_key_length"] == len(key)
