@@ -292,6 +292,22 @@ def test_a_credential_reaching_a_log_line_is_masked_in_the_output(json_logger):
     assert "redacted" in entry["url"]
 
 
+def test_a_credential_inside_an_exception_is_masked_too(json_logger):
+    # The stack trace is the field nobody writes deliberately: a library raising with the
+    # request URL in its message puts a key into a log line no call site chose to emit.
+    logger, lines = json_logger
+
+    try:
+        raise RuntimeError("connect failed for https://api/v1?k=sk-proj-AbCdEfGhIjKlMnOp")
+    except RuntimeError:
+        logger.exception("upstream.request.failed")
+
+    (entry,) = lines()
+    assert "sk-proj-AbCdEfGhIjKlMnOp" not in json.dumps(entry)
+    assert "redacted" in entry["error"]["message"]
+    assert "redacted" in entry["error"]["stack"]
+
+
 @pytest.mark.parametrize(
     ("inbound", "expected"),
     [

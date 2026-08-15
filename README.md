@@ -224,6 +224,11 @@ session tokens.
 One JSON object per line. Every line from a request shares a `request_id`, which also
 appears in the `x-request-id` response header and inside any error body.
 
+Nothing here should carry a credential. Redaction runs over the finished line rather than
+any one field, so a key-shaped string is masked wherever it turns up — event name,
+structured fields, or an exception's text — and the startup line reports the API key as
+presence and length instead of value.
+
 ```bash
 docker compose logs -f middleware
 docker compose logs middleware | grep '"request_id":"3f2a"'   # one request, start to end
@@ -287,7 +292,7 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-151 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
+154 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
 streams that fail mid-flight, end without a terminator, and are abandoned by a cancelled
 consumer.
 
