@@ -219,3 +219,65 @@ def test_a_real_prior_user_turn_prevents_task_detection():
 
     assert is_internal_task_request(messages) is False
     assert inject_system_prompt({"messages": messages}, PROMPT)["messages"][0]["content"] == PROMPT
+
+
+# --- truncated history -------------------------------------------------------
+
+TRUNCATED = '```json\n{"document_type": "receipt", "confidence": 0.9, "fie'
+
+
+def test_a_truncated_extraction_is_replaced_before_it_reaches_the_model():
+    # Half-written JSON is not data — it is this service's own interrupted output, and
+    # leaving it in the history gave the model plausible field paths to copy. Four
+    # attempts to fix that with prompt wording failed 6/6; removing the fragment worked.
+    payload = {
+        "messages": [
+            {"role": "user", "content": "Receipt Tesco: total 3.60 GBP"},
+            {"role": "assistant", "content": TRUNCATED},
+            {"role": "user", "content": "what was the total?"},
+        ]
+    }
+
+    sent = inject_system_prompt(payload, PROMPT)["messages"]
+
+    assert "document_type" not in sent[2]["content"]
+    assert "interrupted" in sent[2]["content"]
+
+
+def test_a_complete_extraction_is_left_alone():
+    complete = '```json\n{"document_type": "receipt"}\n```'
+    payload = {
+        "messages": [
+            {"role": "user", "content": "Receipt Tesco: total 3.60 GBP"},
+            {"role": "assistant", "content": complete},
+            {"role": "user", "content": "what was the total?"},
+        ]
+    }
+
+    sent = inject_system_prompt(payload, PROMPT)["messages"]
+
+    assert sent[2]["content"] == complete
+
+
+def test_only_assistant_turns_are_repaired():
+    # A user pasting a code block with an unbalanced fence is their own text, and must
+    # never be rewritten.
+    user_fence = "here is my log:\n```\nstatus: ok"
+    payload = {"messages": [{"role": "user", "content": user_fence}]}
+
+    sent = inject_system_prompt(payload, PROMPT)["messages"]
+
+    assert sent[1]["content"] == user_fence
+
+
+def test_the_caller_payload_is_not_mutated_by_the_repair():
+    payload = {
+        "messages": [
+            {"role": "assistant", "content": TRUNCATED},
+            {"role": "user", "content": "what was the total?"},
+        ]
+    }
+
+    inject_system_prompt(payload, PROMPT)
+
+    assert payload["messages"][0]["content"] == TRUNCATED

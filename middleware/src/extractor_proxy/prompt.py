@@ -126,6 +126,59 @@ def is_internal_task_request(messages: list[dict[str, Any]]) -> bool:
     return any(stripped.startswith(opening) for opening in DISTINCTIVE_TASK_OPENINGS)
 
 
+#: Replaces the body of an assistant turn that was cut off mid-extraction.
+#:
+#: Four attempts to solve this with words all failed 6 times out of 6: an ANSWER MODE
+#: rule, promoting that rule into the no-exception list, a closing-fence test, and a
+#: code-detected note naming the problem in *this* conversation. The model answered from
+#: the source text every time and cited field paths copied straight out of the truncated
+#: fragment.
+#:
+#: So the fragment is removed rather than argued with. Half-written JSON is not data —
+#: it is the assistant's own interrupted output, and leaving it in the history gives the
+#: model plausible-looking paths to copy. Replacing it with a plain statement of what
+#: happened leaves nothing to copy.
+TRUNCATED_EXTRACTION_PLACEHOLDER = (
+    "[A previous extraction was interrupted before it finished. No fields were produced "
+    "and none of its values are available. If the user asks about it, say the extraction "
+    "was interrupted and offer to run it again.]"
+)
+
+
+def _is_truncated_extraction(message: dict[str, Any]) -> bool:
+    """True when an assistant turn opens a fenced block and never closes it.
+
+    A complete extraction is exactly one fenced json block, so an odd number of fences
+    means the model stopped mid-write — the user pressed stop, or the response hit a
+    token ceiling. Deterministic, and the exact judgement the model cannot make reliably
+    about its own history.
+    """
+    if message.get("role") != "assistant":
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and content.count("```") % 2 == 1
+
+
+def repair_truncated_extractions(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Replace half-written extractions with a statement that they were interrupted.
+
+    Returns the messages and how many were replaced. Only assistant turns this service
+    produced are touched, and only when provably incomplete; the user's own text is
+    never altered.
+    """
+    repaired: list[dict[str, Any]] = []
+    count = 0
+    for message in messages:
+        if _is_truncated_extraction(message):
+            repaired.append({**message, "content": TRUNCATED_EXTRACTION_PLACEHOLDER})
+            count += 1
+        else:
+            repaired.append(message)
+    return repaired, count
+
+
 def inject_system_prompt(payload: dict[str, Any], system_prompt: str) -> dict[str, Any]:
     """Return a copy of `payload` with the extraction prompt prepended to messages.
 
@@ -166,10 +219,17 @@ def inject_system_prompt(payload: dict[str, Any], system_prompt: str) -> dict[st
         # Idempotent: never stack the same prompt twice on a retried request.
         return payload
 
+    messages, repaired = repair_truncated_extractions(messages)
+    if repaired:
+        logger.info("prompt.truncated_history_repaired", extra={"messages_replaced": repaired})
+
     injected = dict(payload)
     injected["messages"] = [{"role": "system", "content": system_prompt}, *messages]
     logger.info(
         "prompt.injection.applied",
-        extra={"message_count": len(injected["messages"])},
+        extra={
+            "message_count": len(injected["messages"]),
+            "truncated_history": bool(repaired),
+        },
     )
     return injected

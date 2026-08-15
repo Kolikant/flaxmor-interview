@@ -118,7 +118,7 @@ flowchart TD
   D -->|no| D1[503 prompt_unavailable]
   D --> E{Open WebUI internal task?}
   E -->|yes| F[forward unchanged]
-  E -->|no| G[prepend extraction prompt]
+  E -->|no| G[repair truncated history,<br/>prepend extraction prompt]
   F --> H{stream requested?}
   G --> H
   H -->|no| I[await upstream, relay bytes]
@@ -129,7 +129,7 @@ flowchart TD
   K -->|client disconnects| K2[release upstream, log abandoned]
 ```
 
-Two branches carry most of the design:
+Three decisions carry most of the design:
 
 **Internal-task detection.** After every message, Open WebUI asks the model to name the
 chat, tag it and suggest searches, using its own prompt templates. Those calls must not
@@ -137,6 +137,13 @@ receive the extraction prompt, or chat titles become JSON. Open WebUI strips its
 `metadata.task` label before forwarding, so the proxy matches the template text instead: a
 final user message, optionally preceded only by system messages, carrying a recognised
 template opening. All eight of Open WebUI 0.6.5's templates are covered.
+
+**Repairing interrupted history.** If a reply is cut off mid-JSON — you press stop, or a
+token ceiling hits — Open WebUI stores the fragment and replays it on every later turn.
+The proxy detects an assistant turn with an unclosed code fence and replaces it with a
+statement that the extraction was interrupted, so a follow-up cannot be answered out of
+half-written fields. Only this service's own incomplete output is touched; your text is
+never altered.
 
 **The first-chunk pull.** Once `200` and `text/event-stream` are sent, the status code
 cannot be changed. So the proxy waits for the first chunk before committing the response:
@@ -235,6 +242,7 @@ docker compose logs middleware | grep service.starting        # effective config
 | `chat.stream.finished` | INFO | chunks and bytes forwarded; logged on disconnect too |
 | `prompt.injection.applied` | INFO | the prompt was prepended |
 | `prompt.injection.skipped` | INFO/WARN | and why — `open_webui_task`, `no_messages`, … |
+| `prompt.truncated_history_repaired` | INFO | how many interrupted extractions were replaced |
 | `upstream.response` | INFO/WARN | what OpenAI answered |
 | `upstream.request.failed` | WARN | could not reach OpenAI |
 | `upstream.stream.interrupted` | WARN | upstream died mid-stream |
@@ -279,7 +287,7 @@ uv venv --python 3.11 && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-147 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
+151 tests, no network access. The upstream is faked with `httpx2.MockTransport`, including
 streams that fail mid-flight, end without a terminator, and are abandoned by a cancelled
 consumer.
 
@@ -304,7 +312,6 @@ Postgres is not published to the host.
 
 ## Limitations
 
-- A prior extraction truncated mid-JSON may be cited in a follow-up as though complete.
 - Follow-up prose can assert a value the extraction recorded as `null`; the JSON is
   authoritative.
 - Source text can attempt to redirect the extraction. It is answered with a rule and a
@@ -362,6 +369,23 @@ response the user watches stream, and hides the one `0.41` among forty `0.98`s.
 is a strong claim the model has to actually honour — it did not at first, which is why
 the prompt now names nine concrete triggers instead of a confidence threshold. Asking a
 model to introspect a number turned out to be close to unactionable.
+
+### The request history is repaired; the response never is
+
+An extraction cut off mid-JSON stays in Open WebUI's history and comes back on every later
+turn, and the model would answer follow-ups out of the half-written fragment — citing
+field paths it never actually produced. Four attempts to fix that in the prompt failed six
+runs out of six. Deleting the fragment worked immediately: an assistant turn with an
+unclosed code fence is replaced before the payload goes upstream.
+
+**Cost, and the lesson:** the proxy now edits conversation history, which is a real
+liability — the detection is deliberately narrow (odd fence count, assistant turns only,
+never the user's text) precisely because it is not free. The lesson is the ordering. Some
+failures are cheaper to make impossible than to argue the model out of, and an unclosed
+fence is a fact about the bytes rather than a judgement the model has to make about its own
+history. What kept this in the "limitations" list for so long was a wrong reason written
+down early — that fixing it meant validating replayed turns, which the streaming design
+rules out. Repairing a *request* has nothing to do with how *responses* stream.
 
 ### Responses are relayed, never re-encoded
 

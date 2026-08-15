@@ -422,19 +422,21 @@ Failed, and what fixing it took:
   computed cannot contradict a stated total. A genuine unit price ("3 crates @ 40.00
   each") is still recorded in 3 of 3 runs, so the rule removes derivation, not data.
 
-Still failing, and left as a known limitation:
+Not fixable here, and moved into the middleware:
 
-- **A truncated prior extraction still gets cited as though it were complete.** Given a
-  history whose assistant turn is cut off mid-JSON, a follow-up gets a confident answer
-  naming `fields.totals.total` — a path that is not in the truncated envelope. The
-  value is read back out of the source text and attributed to a field that was never
-  produced.
-  Two escalations did not shift it: an explicit ANSWER MODE rule, then promoting that
-  rule into the numbered no-exception list. What the second attempt *did* fix is the
-  adjacent case — a field genuinely absent from a **complete** extraction now gets
-  "the extraction is incomplete… please provide more source text", which is correct.
-  The remaining hole needs the source text not to be sitting in the history competing
-  with the rule, and prompt text alone does not appear to win that argument. Closing it
-  properly means the proxy validating assistant turns before they are replayed, which
-  the streaming design deliberately rules out. It is reachable in practice by stopping
-  a response mid-envelope or by hitting a `max_tokens` ceiling.
+- **A truncated prior extraction used to be cited as though it were complete.** Fixed —
+  but not in this document. Four attempts here failed 6 runs out of 6: an ANSWER MODE
+  rule, promoting it into the numbered no-exception list, a closing-fence test, and a
+  note injected by the proxy naming the problem in that specific conversation. Every
+  time, the model answered from the source text and cited a field path copied out of the
+  half-written fragment.
+  What worked was deleting the fragment. The middleware detects an assistant turn with an
+  unclosed code fence — deterministic, and exactly the judgement the model cannot make
+  about its own history — and replaces it with a plain statement that the extraction was
+  interrupted. With nothing left to copy, 6 of 6 runs refuse and offer to re-extract,
+  while a complete extraction is untouched and answered normally in 3 of 3.
+  Worth recording why it took so long: an earlier version of this note claimed the fix
+  "means the proxy validating assistant turns before they are replayed, which the
+  streaming design deliberately rules out". That was simply wrong. Repairing the request
+  history has nothing to do with how responses stream, and a bad reason kept a working
+  fix off the table through four rounds of rewording.
