@@ -379,8 +379,11 @@ runs out of six. Deleting the fragment worked immediately: an assistant turn wit
 unclosed code fence is replaced before the payload goes upstream.
 
 **Cost, and the lesson:** the proxy now edits conversation history, which is a real
-liability — the detection is deliberately narrow (odd fence count, assistant turns only,
-never the user's text) precisely because it is not free. The lesson is the ordering. Some
+liability — the detection is deliberately narrow (assistant turns only, never the user's
+text, and only a message carrying a fence that does not close it) precisely because it is
+not free. Narrowing it was not free either: an earlier version counted fences and called
+the count odd-or-even, which quietly deleted any complete extraction of a document that
+quoted a code block of its own. The lesson is the ordering. Some
 failures are cheaper to make impossible than to argue the model out of, and an unclosed
 fence is a fact about the bytes rather than a judgement the model has to make about its own
 history. What kept this in the "limitations" list for so long was a wrong reason written

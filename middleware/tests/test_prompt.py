@@ -259,6 +259,43 @@ def test_a_complete_extraction_is_left_alone():
     assert sent[2]["content"] == complete
 
 
+def test_an_extraction_quoting_a_code_fence_is_not_mistaken_for_a_truncated_one():
+    # This service extracts from *any* text, so a support ticket carrying a shell
+    # snippet is ordinary input — and the fence inside the extracted value makes the
+    # envelope's fence count odd. Counting fences called that complete extraction
+    # truncated and deleted it from the history, which is the failure this fix exists
+    # to prevent, aimed at the wrong message.
+    quoting = '```json\n{"fields": {"body": "repro:\\n```\\nnpm run dev\\n"}}\n```'
+    payload = {
+        "messages": [
+            {"role": "user", "content": "ticket text with a code block"},
+            {"role": "assistant", "content": quoting},
+            {"role": "user", "content": "what was in the body?"},
+        ]
+    }
+
+    sent = inject_system_prompt(payload, PROMPT)["messages"]
+
+    assert sent[2]["content"] == quoting
+
+
+def test_a_prose_answer_is_not_mistaken_for_a_truncated_extraction():
+    # ANSWER MODE replies carry no fence at all. Testing "ends with a closing fence"
+    # on its own would call every one of them truncated.
+    answer = "The total was 3.60 GBP."
+    payload = {
+        "messages": [
+            {"role": "user", "content": "what was the total?"},
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": "and the date?"},
+        ]
+    }
+
+    sent = inject_system_prompt(payload, PROMPT)["messages"]
+
+    assert sent[2]["content"] == answer
+
+
 def test_only_assistant_turns_are_repaired():
     # A user pasting a code block with an unbalanced fence is their own text, and must
     # never be rewritten.

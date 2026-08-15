@@ -126,6 +126,10 @@ def is_internal_task_request(messages: list[dict[str, Any]]) -> bool:
     return any(stripped.startswith(opening) for opening in DISTINCTIVE_TASK_OPENINGS)
 
 
+#: Markdown code fence. An extraction is one fenced json block, so a complete one ends
+#: on this and an interrupted one does not.
+FENCE = "```"
+
 #: Replaces the body of an assistant turn that was cut off mid-extraction.
 #:
 #: Four attempts to solve this with words all failed 6 times out of 6: an ANSWER MODE
@@ -148,15 +152,22 @@ TRUNCATED_EXTRACTION_PLACEHOLDER = (
 def _is_truncated_extraction(message: dict[str, Any]) -> bool:
     """True when an assistant turn opens a fenced block and never closes it.
 
-    A complete extraction is exactly one fenced json block, so an odd number of fences
-    means the model stopped mid-write — the user pressed stop, or the response hit a
-    token ceiling. Deterministic, and the exact judgement the model cannot make reliably
-    about its own history.
+    Both halves of the test are load-bearing. A fence has to be present, or every
+    ANSWER MODE reply — plain prose, no fence at all — would look truncated. And the
+    content has to *end* on a fence, rather than merely contain an even number of them:
+    counting fences called a complete extraction truncated whenever the extracted
+    document quoted a code block of its own, which for a service that extracts from any
+    text is ordinary input rather than an exotic case.
+
+    What is left is deterministic, and the exact judgement the model cannot make
+    reliably about its own history.
     """
     if message.get("role") != "assistant":
         return False
     content = message.get("content")
-    return isinstance(content, str) and content.count("```") % 2 == 1
+    if not isinstance(content, str):
+        return False
+    return FENCE in content and not content.rstrip().endswith(FENCE)
 
 
 def repair_truncated_extractions(

@@ -430,9 +430,9 @@ Not fixable here, and moved into the middleware:
   note injected by the proxy naming the problem in that specific conversation. Every
   time, the model answered from the source text and cited a field path copied out of the
   half-written fragment.
-  What worked was deleting the fragment. The middleware detects an assistant turn with an
-  unclosed code fence — deterministic, and exactly the judgement the model cannot make
-  about its own history — and replaces it with a plain statement that the extraction was
+  What worked was deleting the fragment. The middleware detects an assistant turn that
+  carries a code fence without closing on one — deterministic, and exactly the judgement
+  the model cannot make about its own history — and replaces it with a plain statement that the extraction was
   interrupted. With nothing left to copy, 6 of 6 runs refuse and offer to re-extract,
   while a complete extraction is untouched and answered normally in 3 of 3.
   Worth recording why it took so long: an earlier version of this note claimed the fix
