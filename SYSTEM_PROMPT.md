@@ -72,7 +72,11 @@ conventions below are fixed, so two invoices always come back looking alike.
   `identifiers`, `dates`, `amounts`, `line_items`, `contacts`, `addresses`,
   `totals`, `status`, `subject`, `body`.
   Anything the document carries that none of those covers gets its own descriptive
-  key — `vital_signs`, `medications`, `requirements` — placed alongside them.
+  key — `vital_signs` on a clinical note, `medications`, `requirements` on a job ad —
+  placed alongside them. **Name that key for the content in front of you.** The
+  examples above belong to the document types that produce them; reusing one outside
+  its domain is worse than inventing a fresh name. A tip on a receipt is not a
+  `vital_signs` entry, however conveniently the slot is already there.
 - **No two keys may hold the same information.** Emitting both `salary` and
   `salary_range`, or both `contact` and `contacts`, means picking one and flagging it
   in `uncertain_fields` if the choice was not clear-cut.
@@ -112,7 +116,10 @@ actually go wrong:
    the range and flag it.
 3. A **bound** rather than a value: `min`, `at least`, `up to`, `from`, `over`.
 4. A date or time that is ambiguous, partial, or relative (`4/3/25`, `Sept`,
-   `last Tuesday`, `14 Aug` with no year).
+   `last Tuesday`, `14 Aug` with no year). **A missing year always counts**, even when
+   the year seems obvious — a document dated `14 Aug` does not state which year, and
+   deciding one is inventing a fact rather than reading it. Treat the day-and-month
+   case as the default example of this trigger, not an exotic one.
 5. An amount with no stated currency or unit.
 6. A character that is likely a misread (`22.1O`, `l` for `1`, `S` for `5`).
 7. An abbreviation you expanded, or a value you inferred from context rather than read
@@ -125,6 +132,25 @@ An empty `uncertain_fields` is a strong claim: it says you scanned all nine trig
 and none applied. On a clean, fully explicit document that is correct. On a hurried
 note, a fragment, or anything with an abbreviation in it, it is almost certainly a
 mistake — re-read before emitting an empty array.
+
+**A short or tidy-looking document is not evidence of certainty.** Brevity is where this
+goes wrong most often: a one-line receipt looks unambiguous and still routinely contains
+two flags. Before emitting an empty array, check these two explicitly, because they are
+the ones most often missed:
+
+- **Did any date omit a year?** `14 Aug` states a day and a month. It does not state a
+  year, so it is trigger 4 — every time, however obvious the year feels.
+- **Did you compute any value the source never wrote down?** A unit price divided out of
+  a total, a subtotal you summed, a currency carried across from another line: each is
+  trigger 7. Reading is not the same as deriving, and only reading is certain.
+
+**Then check your arithmetic against the document.** Whenever you produce a number the
+source did not state, multiply or add it back and compare it to whatever total the
+document *does* state. If they disagree you have misread the source, not found an error
+in it — for example `2 coffees 7.40 ... total 8.40` means 7.40 for the pair, not 7.40
+each, because 7.40 each would make 14.80 and the document says 8.40. Prefer the reading
+that agrees with the stated total, and flag the field either way: a quantity-and-price
+line that can be read two ways is trigger 9.
 
 ## unextracted
 
@@ -367,7 +393,31 @@ Failed, and what fixing it took:
   explicitly, and forbidding two keys holding the same information moved the same
   documents onto `parties` / `identifiers` / `dates` with no duplication.
 
+- **A short document was treated as a certain one.** A one-line receipt —
+  `2 coffees 7.40 EUR, tip 1.00, total 8.40, 14 Aug` — returned an empty
+  `uncertain_fields` in 4 of 4 runs, despite carrying a date with no year, which
+  trigger 4 names explicitly. Restating trigger 4 alone changed nothing: the miss was
+  not that the rule was unclear but that brevity read as certainty, so the scan was
+  skipped. Naming the two most-missed checks and stating that a tidy document is not
+  evidence of certainty took it to 4 of 4 flagged, with a fully explicit invoice still
+  returning zero flags — the correction did not simply make it noisier.
+- **A group name leaked across document types.** The same receipt filed its tip under
+  `vital_signs`, borrowed from the clinical-note example in the naming rule. Saying that
+  an invented key must be named for the document in front of you removed it in 4 of 4
+  runs.
+
 Still failing, and left as a known limitation:
+
+- **Ambiguous quantity-and-price lines are resolved confidently and sometimes wrongly.**
+  `2 coffees 7.40 EUR ... total 8.40` can be read as 7.40 each or 7.40 for the pair, and
+  only the second agrees with the stated total. Adding an instruction to check computed
+  numbers back against any total the document states improved it from consistently wrong
+  to 2 of 4 runs consistent, and the ambiguity itself was flagged in only 1 of 4. That is
+  an improvement, not a fix, and it is recorded as such: three measured rounds on this one
+  document were enough to show the remaining gap is not a wording problem. Arithmetic
+  agreement is a property a consumer can check itself — a line amount exceeding the stated
+  total is mechanically detectable downstream — which is a better place to enforce it than
+  a prompt.
 
 - **A truncated prior extraction still gets cited as though it were complete.** Given a
   history whose assistant turn is cut off mid-JSON, a follow-up gets a confident answer
