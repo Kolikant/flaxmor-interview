@@ -90,8 +90,15 @@ conventions below are fixed, so two invoices always come back looking alike.
 - Repeated things are arrays of objects, even when there is only one.
 - A field the document type implies but the text does not supply is `null` — present
   and null, never omitted. Never invent a plausible value.
-- Every value must be traceable to the source text. You may normalise formatting; you
-  may not add facts.
+- **Never calculate a number. Arithmetic is invention.** If the document states a
+  quantity and one amount, the amount you were given is the one you record and the
+  other is `null` — do not divide, multiply, sum or subtract to fill a field. Given
+  `2 coffees 7.40`, `amount` is `7.40` and `unit_price` is `null`, because the source
+  never wrote a per-coffee price. This is the rule that keeps an extraction internally
+  consistent: a computed figure can contradict a total the document actually states,
+  and then two fields in the same envelope disagree with no way to tell which is real.
+- Every value must be traceable to the source text — you should be able to point at the
+  characters it came from. You may normalise formatting; you may not add facts.
 
 ## uncertain_fields
 
@@ -144,13 +151,10 @@ the ones most often missed:
   a total, a subtotal you summed, a currency carried across from another line: each is
   trigger 7. Reading is not the same as deriving, and only reading is certain.
 
-**Then check your arithmetic against the document.** Whenever you produce a number the
-source did not state, multiply or add it back and compare it to whatever total the
-document *does* state. If they disagree you have misread the source, not found an error
-in it — for example `2 coffees 7.40 ... total 8.40` means 7.40 for the pair, not 7.40
-each, because 7.40 each would make 14.80 and the document says 8.40. Prefer the reading
-that agrees with the stated total, and flag the field either way: a quantity-and-price
-line that can be read two ways is trigger 9.
+**If a line still reads two ways, flag it.** `2 coffees 7.40` does not say whether 7.40
+is the price of one or of both. Record the number the document gives, leave the other
+field `null`, and add the line to `uncertain_fields` as trigger 9 — an ambiguity you
+resolved silently is the one kind of error a reader cannot see.
 
 ## unextracted
 
@@ -406,18 +410,19 @@ Failed, and what fixing it took:
   an invented key must be named for the document in front of you removed it in 4 of 4
   runs.
 
-Still failing, and left as a known limitation:
+- **An ambiguous price line produced an extraction that contradicted itself.**
+  `2 coffees 7.40 EUR ... total 8.40` was read as 7.40 *each*, giving a line amount of
+  14.80 against a stated total of 8.40 — two fields in one envelope disagreeing, with
+  nothing flagged. Two attempts at telling the model to check its arithmetic afterwards
+  only reached 2 of 4 runs consistent.
+  What fixed it was removing the arithmetic instead of policing it. The conventions
+  already said never to invent a value; they never said that *calculating* one is
+  inventing. Stating that — the amount you were given is the one you record, the other
+  is `null` — made 6 of 6 runs internally consistent, because a figure that was never
+  computed cannot contradict a stated total. A genuine unit price ("3 crates @ 40.00
+  each") is still recorded in 3 of 3 runs, so the rule removes derivation, not data.
 
-- **Ambiguous quantity-and-price lines are resolved confidently and sometimes wrongly.**
-  `2 coffees 7.40 EUR ... total 8.40` can be read as 7.40 each or 7.40 for the pair, and
-  only the second agrees with the stated total. Adding an instruction to check computed
-  numbers back against any total the document states improved it from consistently wrong
-  to 2 of 4 runs consistent, and the ambiguity itself was flagged in only 1 of 4. That is
-  an improvement, not a fix, and it is recorded as such: three measured rounds on this one
-  document were enough to show the remaining gap is not a wording problem. Arithmetic
-  agreement is a property a consumer can check itself — a line amount exceeding the stated
-  total is mechanically detectable downstream — which is a better place to enforce it than
-  a prompt.
+Still failing, and left as a known limitation:
 
 - **A truncated prior extraction still gets cited as though it were complete.** Given a
   history whose assistant turn is cut off mid-JSON, a follow-up gets a confident answer
